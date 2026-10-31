@@ -1,3 +1,28 @@
+# =============================================================================
+# Legal Lens — backend CI
+# =============================================================================
+# What this pipeline is: the pre-merge gate for `backend/`. Three independent
+# jobs fan out from a checkout, and a fourth collapses their verdicts into one
+# required status check:
+#
+#     quality   read the source without running it (ruff lint + format)
+#     test      run the unit suite on py3.12 and py3.14, publish HTML reports
+#     docker    build the production image and prove it boots and reports ok
+#        \_________________ all three ___________________/
+#                              |
+#                             ci   the one check branch protection requires
+#
+# What it deliberately does not do: publish anything. No registry push, no
+# package release, no PR comment — the token below is read-only and CD owns
+# everything downstream of a green run.
+#
+# What lives elsewhere: the GPU-weight retrieval tests (the `workflows` extra,
+# several GB of torch/CUDA) run in ci-retrieval.yml, not here.
+#
+# Each section below carries its own notes on why it is shaped the way it is;
+# this header is only the shape.
+# =============================================================================
+
 name: CI
 
 # The gate on main.
