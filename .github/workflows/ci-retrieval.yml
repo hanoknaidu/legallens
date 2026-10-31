@@ -1,0 +1,117 @@
+name: CI (retrieval stack)
+
+# The 21 tests in tests/test_orchestrator_retrieval.py, which are the only ones
+# that load real models and run a real vector store.
+#
+# They are split out of ci.yml because the `workflows` extra pulls torch, the
+# CUDA runtime and triton — several GB a CPU runner will never execute — and the
+# suite then downloads ~4.5GB of weights (BAAI/bge-m3 and BAAI/bge-reranker-v2-m3)
+# on its first question. Putting that on every PR would tax every change for a
+# part of the system few changes touch. Without the extra those tests
+# `importorskip` themselves, so ci.yml stays green and honest about skipping them.
+#
+# Three triggers, so they are still actually gated:
+#   * pull_request, path-filtered — a PR that touches retrieval does get checked
+#   * schedule — a break from a dependency bump surfaces within a day
+#   * workflow_dispatch — run it on demand before merging something risky
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/src/legal_lens/orchestrator/**"
+      - "backend/src/legal_lens/retrieval/**"
+      - "backend/tests/test_orchestrator_retrieval.py"
+      - "backend/tests/test_orchestrated_retrieval.py"
+      - "backend/pyproject.toml"
+      - "backend/uv.lock"
+      - ".github/workflows/ci-retrieval.yml"
+  schedule:
+    # 07:00 UTC daily. Scheduled workflows only run from the default branch, and
+    # GitHub disables them after 60 days of repository inactivity.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-retrieval-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.12.23"
+  # Pin the model caches to paths that can be restored between runs. HF_HOME is
+  # respected by sentence-transformers, which loads the embedder and the
+  # reranker. FASTEMBED_CACHE_PATH steers fastembed's BM25 weights (Qdrant/bm25,
+  # small); if the installed fastembed ignores it, that cache simply misses and
+  # re-downloads — it does not break the run.
+  HF_HOME: /home/runner/.cache/huggingface
+  FASTEMBED_CACHE_PATH: /home/runner/.cache/fastembed
+  # Keep torch off the GPU paths it would look for on a CPU runner.
+  CUDA_VISIBLE_DEVICES: ""
+  FORCE_COLOR: "1"
+
+jobs:
+  retrieval:
+    name: Retrieval tests (real models)
+    runs-on: ubuntu-latest
+    # Generous: a cold run installs multi-GB wheels and downloads ~4.5GB of
+    # weights before the first assertion. A warm run is a few minutes.
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned to a full version, not `@v10`: astral-sh stopped publishing the
+      # floating major tag after v7, so `@v10` resolves to nothing and the job
+      # fails at "Set up job" before a single step runs.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+          # Only 3.14 here, matching the Dockerfile and .venv. The point of this
+          # workflow is the retrieval stack, not interpreter coverage, and
+          # doubling it would double a multi-GB download.
+          python-version: "3.14"
+
+      # Keyed on the model names rather than the lockfile: the weights change when
+      # DEFAULT_EMBED_MODEL / DEFAULT_RERANK_MODEL change, not when a wheel does.
+      # restore-keys lets a run with a changed key still start from the last
+      # download instead of from nothing.
+      - name: Restore the model cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            /home/runner/.cache/huggingface
+            /home/runner/.cache/fastembed
+          key: models-${{ runner.os }}-bge-m3-bge-reranker-v2-m3-qdrant-bm25
+          restore-keys: |
+            models-${{ runner.os }}-
+
+      # `workflows` on top of the standard set. This is the install that costs
+      # minutes; everything above exists to make it cheap on a second run.
+      - name: Run the retrieval tests
+        run: |
+          uv run --frozen \
+            --extra dev --extra ocr --extra orchestrator --extra workflows \
+            pytest tests/test_orchestrator_retrieval.py tests/test_orchestrated_retrieval.py \
+              --html=reports/retrieval-report.html \
+              --self-contained-html \
+              --junitxml=reports/retrieval-junit.xml \
+              -q -rs
+
+      # No coverage here: this workflow runs two files, so its percentage would
+      # read as a project total while measuring a slice of it. ci.yml owns the
+      # coverage number.
+      - name: Upload the HTML report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-retrieval-reports
+          path: backend/reports/
+          if-no-files-found: warn
+          retention-days: 14
