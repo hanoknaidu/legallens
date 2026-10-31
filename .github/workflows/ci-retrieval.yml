@@ -18,12 +18,12 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - "src/legal_lens/orchestrator/**"
-      - "src/legal_lens/retrieval/**"
-      - "tests/test_orchestrator_retrieval.py"
-      - "tests/test_orchestrated_retrieval.py"
-      - "pyproject.toml"
-      - "uv.lock"
+      - "backend/src/legal_lens/orchestrator/**"
+      - "backend/src/legal_lens/retrieval/**"
+      - "backend/tests/test_orchestrator_retrieval.py"
+      - "backend/tests/test_orchestrated_retrieval.py"
+      - "backend/pyproject.toml"
+      - "backend/uv.lock"
       - ".github/workflows/ci-retrieval.yml"
   schedule:
     # 07:00 UTC daily. Scheduled workflows only run from the default branch, and
@@ -58,6 +58,9 @@ jobs:
     # Generous: a cold run installs multi-GB wheels and downloads ~4.5GB of
     # weights before the first assertion. A warm run is a few minutes.
     timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: backend
     steps:
       - uses: actions/checkout@v7
 
@@ -66,7 +69,7 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
-          cache-dependency-glob: uv.lock
+          cache-dependency-glob: backend/uv.lock
           # Only 3.14 here, matching the Dockerfile and .venv. The point of this
           # workflow is the retrieval stack, not interpreter coverage, and
           # doubling it would double a multi-GB download.
@@ -106,6 +109,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ci-retrieval-reports
-          path: reports/
+          path: backend/reports/
           if-no-files-found: warn
           retention-days: 14

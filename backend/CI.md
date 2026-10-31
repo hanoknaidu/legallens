@@ -1,6 +1,8 @@
 # CI
 
-Two workflows, both in `.github/workflows/`. `ci.yml` is the gate on `main`:
+Two workflows, both in `.github/workflows/` **at the repository root** — not
+under `backend/`, where they were first written. Actions only reads workflows
+from the root, so a workflow filed in a subdirectory never runs at all. `ci.yml` is the gate on `main`:
 ruff plus the unit suite on two interpreters, with a browsable HTML test report
 and coverage report attached to every run. `ci-retrieval.yml` carries the 21
 tests that load real models, which are too expensive to put on every PR.
@@ -8,15 +10,29 @@ tests that load real models, which are too expensive to put on every PR.
 No secrets. Nothing in CI makes a network call to the vendor, so there is no
 `ANTHROPIC_API_KEY` in either workflow and nothing asks for one.
 
-## Scope: this repository is `backend/`
+## Scope: `backend/`, a subdirectory of the repository
 
-The git root is `backend/`, not `Legal Lens/`. The sibling `frontend/`, `e2e/`
-and `intent-classifier/` folders are outside it, so CI does not see them and
-cannot check them. Two tests look for those folders and skip themselves when
-they are absent, which in CI is always — see [Expected result](#expected-result).
+The git root is `Legal Lens/`, so `frontend/`, `e2e/` and `intent-classifier/`
+are all in the checkout. These two workflows nonetheless check `backend/` only:
+every job sets `working-directory: backend` for its `run:` steps, and the paths
+handed to actions — setup-uv's `cache-dependency-glob`, the Docker build
+`context`, `upload-artifact`'s `path`, and ci-retrieval's path filters — are
+spelled `backend/...` relative to the root, because an action's own inputs
+ignore `working-directory`. The other three components have no CI yet; they need
+their own jobs.
+
+Two backend tests read across into the siblings — `test_conversation_titles.py`
+checks `frontend/src/lib/constants.ts` and `test_orchestrator_intent.py` checks
+`intent-classifier/intent_prompt.md`. They skip themselves when the folder is
+absent, but it no longer is, so in CI they now run and assert. That is the
+cross-component check those tests were written for, and it means a frontend
+constant drifting from the backend's now fails the gate.
 
 A prerequisite worth stating plainly: Actions runs on GitHub, so none of this
-executes until the repository has a GitHub remote and the branch is pushed.
+executes until the branch is pushed. The remote exists
+(`github.com/hanoknaidu/legallens`); as of this writing the work is on
+`feature/webcode`, and `ci.yml` triggers on PRs to and pushes to `main`, so
+opening the PR is what first exercises it.
 
 ## `ci.yml` — the gate
 
@@ -104,21 +120,23 @@ them.
 
 ### Expected result
 
-**334 passed, 3 skipped.** All three skips are structural, not failures:
+**336 passed, 1 skipped.** The one skip is structural, not a failure:
 
 | Skip | Why |
 |---|---|
 | `test_orchestrator_retrieval.py` | `workflows` extra absent by design — `ci-retrieval.yml` owns it |
-| `test_conversation_titles.py` | `frontend/` is a sibling outside this repository |
-| `test_orchestrator_intent.py` | `intent-classifier/` is a sibling outside this repository |
 
-`-rs` prints each reason into the log, so a *new* skip shows up rather than
-being quietly absorbed into the count.
+`-rs` prints the reason into the log, so a *new* skip shows up rather than being
+quietly absorbed into the count.
 
-Locally you will see 336 passed / 1 skipped instead: the two sibling folders
-exist on your disk, so those tests run. A clean checkout has neither them nor a
-`.env`, which is why `Settings`' `env_file=".env"` reads nothing in CI and the
-defaults apply.
+This figure changed when the workflows moved to the repository root: the two
+sibling-reading tests used to skip in CI and brought the expected result to 334
+passed / 3 skipped. They now run, as they always have locally.
+
+With the `workflows` extra installed — which your `.venv` has — you get **358
+passed, 0 skipped** locally, because the retrieval tests import rather than
+skip. A clean checkout has no `.env`, which is why `Settings`' `env_file=".env"`
+reads nothing in CI and the defaults apply.
 
 ## Reports
 
@@ -136,7 +154,7 @@ when the report is worth reading.
 The coverage total and a per-file table are also written to the run summary, so
 the number is visible without downloading anything.
 
-Coverage is **79%**, measured and reported but **not gated** — there is no
+Coverage is **83%**, measured and reported but **not gated** — there is no
 `fail_under`. Much of what is uncovered is the lazy optional-extra guards that
 cannot run in the gate's configuration. Add a floor once the number settles.
 

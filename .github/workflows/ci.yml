@@ -32,10 +32,13 @@ name: CI
 # only breaks once combined with main. The `push` entry re-runs the same checks
 # on the commit that landed, which is the signal a CD pipeline reads later.
 #
-# Note on scope: this repository's root is `backend/`, so that is all CI sees.
-# The sibling `frontend/`, `e2e/` and `intent-classifier/` folders are outside
-# it and are not checked here — two tests detect their absence and skip
-# themselves rather than fail (see the run summary).
+# Note on scope: this gate checks `backend/` only, which is a subdirectory of
+# the repository rather than its root — every job below runs its commands from
+# there (`working-directory: backend`). The sibling `frontend/`, `e2e/` and
+# `intent-classifier/` folders are in the repository but are not checked here;
+# they need their own jobs. Two backend tests read across into `frontend/` and
+# `intent-classifier/` and, now that those folders are present in the checkout,
+# they run and assert rather than skipping themselves.
 on:
   pull_request:
     branches: [main]
@@ -91,6 +94,13 @@ jobs:
     name: Quality
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The gate's commands all run in `backend/`, the only part of the repository
+    # this workflow checks. This applies to `run:` steps only — an action's own
+    # inputs ignore it, which is why the paths handed to setup-uv, build-push and
+    # upload-artifact below are spelled out relative to the repository root.
+    defaults:
+      run:
+        working-directory: backend
     steps:
       - uses: actions/checkout@v7
 
@@ -99,7 +109,7 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
-          cache-dependency-glob: uv.lock
+          cache-dependency-glob: backend/uv.lock
           python-version: "3.14"
 
       # `--extra dev` only: ruff reads the source, it does not import it, so
@@ -133,6 +143,9 @@ jobs:
     name: Tests (py${{ matrix.python }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
     strategy:
       # Both versions report. Otherwise the first failure cancels the other and
       # hides whether the break is version-specific, which is the one thing a
@@ -151,7 +164,7 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
-          cache-dependency-glob: uv.lock
+          cache-dependency-glob: backend/uv.lock
           python-version: ${{ matrix.python }}
 
       # No secrets, by construction. conftest.py builds
@@ -161,11 +174,13 @@ jobs:
       # no `.env` in a clean checkout (it is gitignored), which is why
       # `Settings`' `env_file=".env"` reads nothing and the defaults apply.
       #
-      # Expect: 334 passed, 3 skipped. The three skips are structural, not
-      # failures — the `workflows` extra is absent by design, and `frontend/` and
-      # `intent-classifier/` are siblings outside this repository, so the two
-      # tests that look for them skip themselves. `-rs` prints each reason into
-      # the log so a new skip is visible rather than silently absorbed.
+      # Expect: 336 passed, 1 skipped. The one skip is structural, not a failure
+      # — the `workflows` extra is absent by design, so the retrieval tests
+      # `importorskip` themselves and ci-retrieval.yml runs them instead. The two
+      # tests that read `frontend/` and `intent-classifier/` are in the 336: both
+      # folders are in this repository, so they assert rather than skip. `-rs`
+      # prints each reason into the log so a new skip is visible rather than
+      # silently absorbed.
       - name: Run tests
         run: |
           uv run --frozen --extra dev --extra ocr --extra orchestrator \
@@ -210,7 +225,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ci-reports-py${{ matrix.python }}
-          path: reports/
+          path: backend/reports/
           if-no-files-found: warn
           retention-days: 14
 
@@ -243,7 +258,7 @@ jobs:
       - name: Build
         uses: docker/build-push-action@v7
         with:
-          context: .
+          context: ./backend
           push: false
           load: true
           tags: legallens-backend:ci
