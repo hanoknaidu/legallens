@@ -1,0 +1,81 @@
+# Legal Lens, both services, one command:
+#
+#   cp backend/.env.docker.example backend/.env.docker   # then fill in the key
+#   docker compose up --build
+#   open http://localhost:8080
+#
+# The browser talks only to the frontend. nginx inside it proxies /api to the
+# backend over this file's private network, which is why the app is same-origin
+# and CORS never comes up — the same arrangement the Vite proxy makes in dev.
+#
+# No `version:` key: it has been ignored since Compose v2 and warns if present.
+
+name: legallens
+
+services:
+  backend:
+    build:
+      context: ./backend
+      # Space-separated extras from pyproject.toml. Empty is the configuration
+      # that needs no local model and no vector server. See backend/DOCKER.md
+      # before setting "orchestrator workflows" — it pulls torch and the CUDA
+      # runtime, then downloads ~4.5GB of models on the first question.
+      args:
+        EXTRAS: "${BACKEND_EXTRAS:-}"
+    # Where ANTHROPIC_API_KEY comes from. The file is optional only because
+    # LEGAL_LENS_LLM_PROVIDER below defaults to `echo`, which needs no key. With
+    # the `anthropic` provider a missing key is fatal: the lifespan raises and
+    # the service never finishes starting (backend/DOCKER.md).
+    env_file:
+      - path: ./backend/.env.docker
+        required: false
+    environment:
+      # Set here rather than in the image so the stack is useful before a key
+      # exists: `echo` is the deterministic stub and makes no vendor call.
+      # Switch to `anthropic` (or drop the line — it is the image default) once
+      # backend/.env.docker has a key.
+      LEGAL_LENS_LLM_PROVIDER: "${LEGAL_LENS_LLM_PROVIDER:-echo}"
+      # The image defaults to prod, which disables /api/docs and
+      # /api/openapi.json. This is a local stack, so the docs are worth having.
+      LEGAL_LENS_ENVIRONMENT: "${LEGAL_LENS_ENVIRONMENT:-dev}"
+    volumes:
+      # The SQLite database, every uploaded original and the live vector index.
+      # Without this, a `docker compose down` loses every document.
+      - legallens-data:/data
+    ports:
+      # Published only so you can reach /api/docs and curl the API directly;
+      # the frontend does not need it. 8001 because you already have a backend
+      # on 8000 — override with BACKEND_PORT if that changes.
+      - "${BACKEND_PORT:-8001}:8000"
+    # Above the image's GRACEFUL_TIMEOUT of 30s, so Compose does not SIGKILL
+    # uvicorn while it is still draining an SSE stream.
+    stop_grace_period: 40s
+    # The image carries its own HEALTHCHECK against /api/health; it is named
+    # here only because the frontend waits on it below.
+    healthcheck:
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Vite inlines VITE_* at build time, so this cannot be changed by
+        # restarting the container. `true` serves the MSW mock layer instead of
+        # the backend — the only path with demo content, since a real database
+        # starts empty.
+        VITE_USE_MOCKS: "${VITE_USE_MOCKS:-false}"
+    environment:
+      # Service name, not localhost: this resolves on Compose's network.
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "${FRONTEND_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        # Wait for /api/health to pass rather than just for the container to
+        # exist. The frontend survives a missing backend — nginx resolves the
+        # upstream per request and the UI reports it — but a stack that comes up
+        # already working beats one that 502s for the first few seconds.
+        condition: service_healthy
+
+volumes:
+  legallens-data:

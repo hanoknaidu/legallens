@@ -1,0 +1,116 @@
+# Rendered to /etc/nginx/conf.d/default.conf at container start by the base
+# image's envsubst entrypoint. Only ${PORT}, ${BACKEND_URL} and
+# ${NGINX_LOCAL_RESOLVERS} are substituted (NGINX_ENVSUBST_FILTER in the
+# Dockerfile); every other $name below is an nginx variable and is left alone,
+# which is what the filter is there to guarantee.
+
+# Resolve upstream names at request time rather than at startup. nginx resolves
+# a literal `proxy_pass` host once, while reading its config: that makes the
+# container refuse to boot whenever the backend's DNS name does not exist yet —
+# true of a cold `docker run` with no API beside it, and true of a fresh AKS
+# namespace where the backend Service is not created yet — and then pins the
+# first IP it saw for the life of the process. A `set` variable in proxy_pass
+# defers both, at the cost of needing an explicit resolver.
+#
+# ${NGINX_LOCAL_RESOLVERS} is filled in by the base image's
+# 15-local-resolvers.envsh from /etc/resolv.conf, which is how the same config
+# finds Docker's 127.0.0.11 locally and kube-dns in AKS without being told.
+resolver ${NGINX_LOCAL_RESOLVERS} ipv6=off valid=30s;
+
+server {
+    listen ${PORT};
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # The UI rejects anything over 50MB itself (MAX_UPLOAD_BYTES); the slack is
+    # for multipart framing, so the proxy is never the thing that refuses an
+    # upload the app already accepted.
+    client_max_body_size 55m;
+
+    # The bundle is text and compresses roughly fourfold. `gzip_proxied any` is
+    # load-bearing in AKS, where this sits behind an ingress controller and so
+    # sees proxied requests almost exclusively.
+    gzip on;
+    gzip_proxied any;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css application/javascript application/json
+               image/svg+xml font/woff2;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    # This container's own health answer. Deliberately does not check the
+    # backend: a readiness probe that reached through to the API would pull the
+    # whole UI out of rotation every time the API was briefly unwell, and the
+    # app has a BackendStatus component that already reports that in the UI.
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # Vite fingerprints everything under /assets/, so the bytes behind a given
+    # URL can never change and the response is safe to cache indefinitely.
+    # The two security headers are repeated because nginx's add_header does not
+    # inherit into a block that sets one of its own.
+    location /assets/ {
+        # One directive rather than `expires 1y` plus an add_header: those two
+        # emit a Cache-Control header each, and a response carrying both is
+        # merely something browsers tolerate.
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        add_header X-Content-Type-Options nosniff always;
+        access_log off;
+        try_files $uri =404;
+    }
+
+    # index.html names the current hashed bundles. Cached, a browser would keep
+    # asking for the previous deploy's filenames and 404 on every one.
+    location = /index.html {
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+    }
+
+    # Shipped by the mock layer and inert unless VITE_USE_MOCKS was true at
+    # build time, but a stale service worker is the one file that can outlive a
+    # deploy and keep serving it.
+    location = /mockServiceWorker.js {
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+    }
+
+    # API_BASE is the relative "/api" (src/lib/constants.ts) and the backend
+    # mounts its routers under that same prefix (main.py API_PREFIX), so this
+    # forwards the path unchanged — no rewrite. It also keeps the browser
+    # same-origin, which is why CORS never enters the picture in a container
+    # either, exactly as the Vite proxy arranges in dev.
+    location /api/ {
+        set $backend ${BACKEND_URL};
+        proxy_pass $backend$request_uri;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Chat answers stream token by token over SSE. Buffering would hold the
+        # whole generation and deliver it as one late blob, and the default 60s
+        # read timeout would cut a long answer off mid-sentence. `Connection ""`
+        # stops nginx forwarding the client's hop-by-hop header upstream, which
+        # is what keeps the streamed response from being closed early.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_set_header Connection "";
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+
+    # react-router's createBrowserRouter owns /documents, /settings and
+    # /chat/:id (src/app/router.tsx) — URLs with no file behind them. Without
+    # this fallback, a refresh or a shared link on any of them is an nginx 404.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

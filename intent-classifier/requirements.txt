@@ -1,0 +1,2 @@
+# Everything this needs. Nothing from the Legal Lens backend.
+langchain-anthropic>=1.7

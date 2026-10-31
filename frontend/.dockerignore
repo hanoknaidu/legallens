@@ -1,0 +1,32 @@
+# Installed inside the builder from the lockfile. Copying a host node_modules in
+# would be slow and would carry darwin-arm64 binaries into a linux/amd64 image.
+node_modules
+
+# Built inside the image. A stale host dist/ must never be what ships.
+dist
+.vite
+tsconfig.tsbuildinfo
+
+# Dev-only, and `vite build` runs in production mode so it would not read them
+# anyway — but they stay out of the image on principle.
+.env
+.env.*
+.env.development
+.env.development.local
+
+.git
+.gitignore
+
+# Docker's own files: changing a comment in the Dockerfile should not invalidate
+# the build context.
+Dockerfile
+.dockerignore
+README.md
+DOCKER.md
+
+*.log
+npm-debug.log*
+coverage
+.DS_Store
+.idea
+.vscode

@@ -1,0 +1,19 @@
+Observed 2026-10-21, conversation "Summarise New Jersey Bicycle Laws." (summary turn)
+
+  [1] p1 len=2963  on-page=True
+  [2] p2 len=2567  on-page=True
+  [3] p4 len=3452  on-page=True
+  [4] p5 len=1090  on-page=True
+  [5] p3 len=6667  on-page=FALSE   <-- cited_text = page 3 + page 4 concatenated
+  [6] p3 len=3215  on-page=True
+
+  page char counts (normalised): p1=2910 p2=2521 p3=3168 p4=3404 p5=1032
+  norm(page3 + " " + page4) == norm(citation 5 citedText)  ->  True
+  summary fields citing source 5: Obligations, Liability & indemnification,
+                                  Unusual provisions, Open items
+
+Root cause: orchestrator/citations.py resolve() reads only `start_block_index` and
+ignores `end_block_index`, so a citation spanning two page blocks keeps the whole
+concatenated cited_text while being labelled with the first page only. The viewer
+highlights by searching that one page, finds nothing, and shows "The cited passage was
+not found in this page's text."
