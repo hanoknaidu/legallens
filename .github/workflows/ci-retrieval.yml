@@ -64,8 +64,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Pinned to a full version, not `@v10`: astral-sh stopped publishing the
+      # floating major tag after v7, so `@v10` resolves to nothing and the job
+      # fails at "Set up job" before a single step runs.
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
