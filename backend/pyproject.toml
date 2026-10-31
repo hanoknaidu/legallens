@@ -1,0 +1,94 @@
+[project]
+name = "legal-lens-backend"
+version = "0.1.0"
+description = "Legal Lens API — grounded Q&A, structured summary and drafting over attorney documents"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "python-multipart>=0.0.12",
+    "aiosqlite>=0.20",
+    "anthropic>=0.40",
+    "pypdf>=5.1",
+    "python-docx>=1.1",
+]
+
+[project.optional-dependencies]
+# Each extra is one swappable implementation behind an interface (BRD NFR-11).
+# None of them is required to boot: config selects a built-in fallback instead.
+qdrant = ["qdrant-client>=1.12"]
+docling = ["docling>=2.0"]
+# OCR for scanned PDFs (FR-2 is detect-and-reject by default; this enables the
+# alternative). PyMuPDF rasterises in-process, so no system binary is needed for the
+# Claude vision engine. The tesseract engine additionally needs the `tesseract`
+# binary: `brew install tesseract`.
+ocr = ["pymupdf>=1.26", "pytesseract>=0.3.13", "pillow>=11.0"]
+embeddings-local = ["sentence-transformers>=3.3"]
+# pytest-cov and pytest-html are what CI publishes its reports from, and are in
+# `dev` rather than a CI-only extra so a failing run can be reproduced locally with
+# the same command the pipeline uses.
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
+    "ruff>=0.8",
+    "pytest-cov>=6.0",
+    "pytest-html>=4.1",
+]
+# The orchestration layer. Separate from the core so the API keeps booting without
+# LangChain installed, and so the orchestrator can be tested on its own.
+orchestrator = ["langchain-anthropic>=1.7", "langchain-core>=1.6"]
+# The retrieval stack the three workflows share. Separate from `orchestrator` because
+# it pulls torch: installing it takes minutes and ~2GB, and the intent classifier —
+# which is the rest of that package — needs none of it.
+workflows = [
+    "qdrant-client>=1.19",      # embedded local mode: no server, no Docker
+    "fastembed>=0.9",           # BM25 sparse vectors, tokenised Qdrant's way
+    "sentence-transformers>=3.3",  # dense embedder and the cross-encoder reranker
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/legal_lens"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+# Coverage is measured but not gated: no `fail_under` here. The suite covers the
+# API contract and the orchestrator deliberately and leaves the lazy optional-extra
+# branches uncovered by design, so a single percentage is a report to read rather
+# than a threshold to defend. CI publishes it as HTML; add a floor once the number
+# has settled.
+[tool.coverage.run]
+source = ["src/legal_lens"]
+branch = true
+# The test process and the app it drives are the same process here, but the OCR
+# and orchestrator paths spawn none — so no `concurrency` setting is needed.
+omit = ["*/__pycache__/*", "*/tests/*"]
+
+[tool.coverage.report]
+# Lazy `import pymupdf`-style guards inside functions are unreachable when the
+# extra is absent, which is the configuration CI runs; excluding them keeps the
+# report about code the suite could have exercised.
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "@(abc\\.)?abstractmethod",
+]
+skip_covered = false
+show_missing = true

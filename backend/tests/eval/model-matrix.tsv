@@ -1,0 +1,5 @@
+embedder	reranker	recall@1	recall@3	recall@8	mrr	wrong_first	lookup	paraphrase	collision	cross_doc	encode_ms	rerank_ms
+bge_m3	none	0.5556	0.7222	0.8889	0.7537	6	0.6000	0.5833	0.5000	0.5000	84.8	0.0
+bge_m3	ms_marco	0.5556	0.8333	0.9167	0.7910	6	0.6000	0.4167	0.7500	0.5000	84.8	152.8
+bge_m3	bge_base	0.3333	0.6667	0.9167	0.5966	11	0.8000	0.1667	0.0000	0.3333	84.8	1000.7
+bge_m3	bge_v2_m3	0.6389	0.8333	0.9167	0.8410	4	0.8000	0.3333	1.0000	0.5000	84.8	3550.3

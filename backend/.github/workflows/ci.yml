@@ -1,0 +1,300 @@
+name: CI
+
+# The gate on main.
+#
+# `pull_request` is the trigger that actually guards a merge: GitHub runs it
+# against the *merge result*, not the branch tip, so it catches the change that
+# only breaks once combined with main. The `push` entry re-runs the same checks
+# on the commit that landed, which is the signal a CD pipeline reads later.
+#
+# Note on scope: this repository's root is `backend/`, so that is all CI sees.
+# The sibling `frontend/`, `e2e/` and `intent-classifier/` folders are outside
+# it and are not checked here — two tests detect their absence and skip
+# themselves rather than fail (see the run summary).
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A second push to a PR makes the first run's verdict irrelevant, so stop it and
+# save the runner. `github.ref` is per-PR, so cancelling a PR's run can never
+# cancel the run on main.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only. Nothing here writes to the repository, publishes a package or
+# comments on a PR. CD will need more than this and should request it in its own
+# workflow rather than widening the gate's token.
+permissions:
+  contents: read
+
+env:
+  # Pinned to the uv that wrote uv.lock, which is also the one the Dockerfile
+  # copies (`ghcr.io/astral-sh/uv:0.12.23`). A newer uv can resolve or rewrite
+  # the lockfile differently, which would let CI pass against a dependency set
+  # the production image never builds.
+  UV_VERSION: "0.12.23"
+
+  FORCE_COLOR: "1"
+
+# The extras the suite needs are spelled out in full at each call site below
+# (`--extra dev --extra ocr --extra orchestrator`) rather than held in an env var.
+# An env var holding several flags only works in a shell that word-splits it:
+# Actions' default bash does, but zsh — the macOS default — does not, so the var
+# version of these commands fails when a developer copies it out of here to
+# reproduce a red build locally. Three repetitions is the cheaper problem.
+#
+# Why those three: `dev` alone is not enough. Without `ocr` the OCR pipeline tests
+# fail on a lazy `import pymupdf`, and without `orchestrator` the intent and
+# rewrite tests fail on `import langchain_anthropic` — 18 failures and 11 errors
+# between them, because those imports sit inside functions and so are invisible
+# at collection time.
+#
+# `workflows` is deliberately absent: it pulls torch, the CUDA runtime and triton
+# — several GB a CPU runner never executes — for the 21 tests in
+# test_orchestrator_retrieval.py, which `importorskip` themselves without it.
+# ci-retrieval.yml runs those separately.
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Quality: the checks that read the source without running it.
+  # ---------------------------------------------------------------------------
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: "3.14"
+
+      # `--extra dev` only: ruff reads the source, it does not import it, so
+      # installing ocr/orchestrator here would be install time spent for nothing.
+      # `--frozen` makes uv use uv.lock exactly and fail if pyproject.toml has
+      # drifted from it, which turns "edited pyproject.toml without relocking"
+      # into a CI failure instead of a silent re-resolve.
+      #
+      # --output-format=github puts each violation on the PR diff as an
+      # annotation, so a reviewer sees it in the file rather than in the log.
+      - name: Lint (ruff check)
+        run: uv run --frozen --extra dev ruff check --output-format=github .
+
+      # Blocking. The repository was formatted in one mechanical pass when this
+      # pipeline was added (52 files reformatted, 63 already clean, and the suite
+      # unchanged at 358 passed), so the tree is clean and any drift from here is
+      # a real diff rather than a backlog.
+      #
+      # `ruff format` and `ruff check` disagree about nothing here: the lint rule
+      # set (E, F, I, UP, B, ASYNC) contains no stylistic rule the formatter also
+      # owns, so the two cannot fight over the same line.
+      #
+      # If this fails: run `uv run ruff format .` and commit the result.
+      - name: Format (ruff format --check)
+        run: uv run --frozen --extra dev ruff format --check .
+
+  # ---------------------------------------------------------------------------
+  # Tests: the unit suite, with the HTML reports attached to the run.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Both versions report. Otherwise the first failure cancels the other and
+      # hides whether the break is version-specific, which is the one thing a
+      # two-version matrix exists to tell you.
+      fail-fast: false
+      matrix:
+        # 3.14 is what .venv, the Dockerfile and production run. 3.12 is the floor
+        # pyproject.toml declares (`requires-python = ">=3.12"`); testing it is
+        # what keeps that floor honest rather than aspirational.
+        python: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: ${{ matrix.python }}
+
+      # No secrets, by construction. conftest.py builds
+      # `Settings(environment="test", llm_provider="echo")`, the startup LLM probe
+      # is skipped under that environment, and no test makes a network call — so
+      # there is no ANTHROPIC_API_KEY here and nothing asks for one. There is also
+      # no `.env` in a clean checkout (it is gitignored), which is why
+      # `Settings`' `env_file=".env"` reads nothing and the defaults apply.
+      #
+      # Expect: 334 passed, 3 skipped. The three skips are structural, not
+      # failures — the `workflows` extra is absent by design, and `frontend/` and
+      # `intent-classifier/` are siblings outside this repository, so the two
+      # tests that look for them skip themselves. `-rs` prints each reason into
+      # the log so a new skip is visible rather than silently absorbed.
+      - name: Run tests
+        run: |
+          uv run --frozen --extra dev --extra ocr --extra orchestrator \
+            pytest \
+              --cov \
+              --cov-report=term-missing:skip-covered \
+              --cov-report=html:reports/coverage \
+              --cov-report=xml:reports/coverage.xml \
+              --html=reports/pytest-report.html \
+              --self-contained-html \
+              --junitxml=reports/junit.xml \
+              -q -rs
+
+      # `always()`: a failing suite is precisely when the coverage table is worth
+      # reading, so it is published even though the step above failed. The
+      # `.coverage` guard covers the case where pytest died before writing any.
+      - name: Publish the coverage table to the run summary
+        if: always()
+        run: |
+          if [ ! -f .coverage ]; then
+            echo "### Coverage (py${{ matrix.python }}): no data — the suite did not get far enough" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Same extras as the test step on purpose: a different set here would
+          # make uv re-sync the environment just to read a file it already wrote.
+          total="$(uv run --frozen --extra dev --extra ocr --extra orchestrator coverage report --format=total)"
+          {
+            echo "### Coverage (py${{ matrix.python }}): ${total}%"
+            echo
+            echo "<details><summary>Per-file breakdown</summary>"
+            echo
+            uv run --frozen --extra dev --extra ocr --extra orchestrator coverage report --format=markdown
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The browsable reports: pytest-report.html is one self-contained file, and
+      # coverage/index.html is the line-by-line view. Uploaded on failure too,
+      # for the same reason as the summary above.
+      - name: Upload the HTML reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-reports-py${{ matrix.python }}
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Docker: prove the image still builds and still boots.
+  # ---------------------------------------------------------------------------
+  # Without this the gate can go green on a change that breaks the thing that
+  # actually ships — the suite imports from `src/`, it never exercises the
+  # Dockerfile. The default `EXTRAS=""` build is the one checked, because that is
+  # the configuration that boots with no local model and no vector server; the
+  # `workflows` build is 6.42GB and belongs nowhere near a PR gate.
+  #
+  # This builds and boots but never pushes. Publishing is CD's job and needs a
+  # registry credential this workflow deliberately does not have.
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      # buildx, because the default docker driver cannot use the GitHub Actions
+      # cache backend that makes the second build cheap.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # `load: true` puts the image into the local daemon so the next step can
+      # actually run it. Without it the build stays in buildx's cache and there
+      # is nothing to boot.
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: legallens-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A build that succeeds and an image that boots are different claims, and
+      # the gap between them is where a bad ENTRYPOINT or a missing runtime file
+      # lives. `LEGAL_LENS_LLM_PROVIDER=echo` is what makes this possible without
+      # a secret: it needs no key at all, and `environment=test` skips the
+      # startup probe that would otherwise make one vendor call.
+      #
+      # Verified locally against this image: healthy in 2s, every check `ok`.
+      - name: Smoke-test the image
+        run: |
+          docker run -d --rm -p 8000:8000 \
+            -e LEGAL_LENS_LLM_PROVIDER=echo \
+            -e LEGAL_LENS_ENVIRONMENT=test \
+            --name ll-smoke legallens-backend:ci
+
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/api/health -o health.json; then
+              echo "Healthy after ${i}s."
+              cat health.json
+              # Responding is not the same as being well: a degraded check still
+              # returns 200, so assert on the status field rather than on curl.
+              grep -q '"status":"ok"' health.json || {
+                echo "::error::/api/health answered but did not report ok"
+                exit 1
+              }
+              {
+                echo "### Docker image"
+                echo
+                echo "Built and booted. \`/api/health\` after ${i}s:"
+                echo
+                echo '```json'
+                cat health.json
+                echo
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "::error::the container never became healthy within 60s"
+          docker logs ll-smoke || true
+          exit 1
+
+      # `always()`: if the step above timed out, the container is still running
+      # and still holding port 8000.
+      - name: Stop the container
+        if: always()
+        run: docker rm -f ll-smoke || true
+
+  # ---------------------------------------------------------------------------
+  # The single check to require in branch protection.
+  # ---------------------------------------------------------------------------
+  # A matrix job's name carries the matrix value ("Tests (py3.12)"), so requiring
+  # those by name breaks the moment the matrix changes. This job's name does not
+  # move. `if: always()` plus an explicit result test is what makes a skipped or
+  # cancelled dependency count as a failure — `needs` alone treats "skipped" as
+  # satisfied, which would turn a cancelled run into a green merge.
+  ci:
+    name: CI
+    if: always()
+    needs: [quality, test, docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every upstream job to have succeeded
+        run: |
+          echo "quality: ${{ needs.quality.result }}"
+          echo "test:    ${{ needs.test.result }}"
+          echo "docker:  ${{ needs.docker.result }}"
+          [ "${{ needs.quality.result }}" = "success" ] || exit 1
+          [ "${{ needs.test.result }}" = "success" ] || exit 1
+          [ "${{ needs.docker.result }}" = "success" ] || exit 1
+          echo "All required checks passed."

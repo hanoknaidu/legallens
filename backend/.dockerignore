@@ -1,0 +1,41 @@
+# Secrets. .env holds a real Anthropic key; it must never enter a layer. The key
+# arrives at run time via --env-file or an AKS secret.
+.env
+.env.*
+!.env.example
+
+# Local state: the SQLite database, uploaded originals, the Qdrant index. The
+# container gets an empty /data, and 40MB of someone's local matters is not
+# build context.
+var/
+
+# Built inside the image from uv.lock. A host .venv is darwin-arm64 and would be
+# useless in a linux/amd64 image even if it were copied.
+.venv/
+
+# Not part of the service. The image runs the API; tests run in CI against the
+# source tree, where pytest's pythonpath=["src"] already works.
+tests/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+
+# Developer utilities that read and write a local .env.
+check_key.py
+set_key.py
+scripts/
+
+.git
+.gitignore
+
+# Docker's own files: editing a comment in the Dockerfile should not invalidate
+# the context.
+Dockerfile
+.dockerignore
+DOCKER.md
+
+*.log
+.DS_Store
+.idea
+.vscode
