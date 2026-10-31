@@ -188,6 +188,12 @@ jobs:
       # prints each reason into the log so a new skip is visible rather than
       # silently absorbed.
       - name: Run tests
+        # A shared runner is slower than any developer machine, and the ingestion
+        # polling budget in tests/helpers.py is tight by design. 60s here is not a
+        # looser assertion — a pipeline that genuinely stalls still fails, it just
+        # no longer fails because the runner was busy.
+        env:
+          LEGAL_LENS_TEST_TERMINAL_TIMEOUT_S: "60"
         run: |
           uv run --frozen --extra dev --extra ocr --extra orchestrator \
             pytest \
