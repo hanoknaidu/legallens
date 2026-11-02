@@ -1,14 +1,16 @@
 # =============================================================================
-# Legal Lens — backend CI
+# Legal Lens — CI
 # =============================================================================
-# What this pipeline is: the pre-merge gate for `backend/`. Three independent
-# jobs fan out from a checkout, and a fourth collapses their verdicts into one
-# required status check:
+# What this pipeline is: the pre-merge gate. Five independent jobs fan out from
+# a checkout, and a sixth collapses their verdicts into one required status
+# check:
 #
-#     quality   read the source without running it (ruff lint + format)
-#     test      run the unit suite on py3.12 and py3.14, publish HTML reports
-#     docker    build the production image and prove it boots and reports ok
-#        \_________________ all three ___________________/
+#     quality    read the backend source without running it (ruff lint+format)
+#     test       run the unit suite on py3.12 and py3.14, publish HTML reports
+#     docker     build the production image and prove it boots and reports ok
+#     frontend   typecheck and build the bundle that actually ships
+#     e2e-specs  prove the 73 Playwright specs still load and collect
+#        \__________________ all five ____________________/
 #                              |
 #                             ci   the one check branch protection requires
 #
@@ -18,6 +20,16 @@
 #
 # What lives elsewhere: the GPU-weight retrieval tests (the `workflows` extra,
 # several GB of torch/CUDA) run in ci-retrieval.yml, not here.
+#
+# What is deliberately not gated: running the e2e suite, and the standalone
+# intent classifier. Both need a real ANTHROPIC_API_KEY — the e2e run cost $1.35
+# over 114 model calls when it was measured, and every `classify.py` invocation
+# is a vendor call. A gate that needs a secret and spends money on every PR is a
+# gate people turn off, so this workflow checks what it can without one: that
+# the specs compile and collect, and that `classify.py` byte-compiles. The one
+# real cross-component assertion is already in the unit suite, where
+# test_conversation_titles.py and test_orchestrator_intent.py read `frontend/`
+# and `intent-classifier/` and fail on drift.
 #
 # Each section below carries its own notes on why it is shaped the way it is;
 # this header is only the shape.
@@ -32,13 +44,15 @@ name: CI
 # only breaks once combined with main. The `push` entry re-runs the same checks
 # on the commit that landed, which is the signal a CD pipeline reads later.
 #
-# Note on scope: this gate checks `backend/` only, which is a subdirectory of
-# the repository rather than its root — every job below runs its commands from
-# there (`working-directory: backend`). The sibling `frontend/`, `e2e/` and
-# `intent-classifier/` folders are in the repository but are not checked here;
-# they need their own jobs. Two backend tests read across into `frontend/` and
-# `intent-classifier/` and, now that those folders are present in the checkout,
-# they run and assert rather than skipping themselves.
+# Note on scope: each job sets its own `working-directory`, because no component
+# lives at the repository root — `backend/` for the three Python jobs,
+# `frontend/` and `e2e/` for theirs. Paths handed to an action are spelled from
+# the root instead, since an action's inputs ignore `working-directory`.
+#
+# No `paths` filter here on purpose. This is the required status check, and a
+# path-filtered required check never reports on a PR outside its filter, which
+# leaves branch protection waiting on a check that will never arrive. Every job
+# runs on every PR; the slowest is about a minute.
 on:
   pull_request:
     branches: [main]
@@ -138,6 +152,16 @@ jobs:
       # If this fails: run `uv run ruff format .` and commit the result.
       - name: Format (ruff format --check)
         run: uv run --frozen --extra dev ruff format --check .
+
+      # `intent-classifier/` is a standalone script with one dependency and no
+      # uv, and it cannot be run here: every invocation is a real Anthropic call.
+      # Byte-compiling it is the most that can be checked without a key, and it
+      # still catches the syntax error that would otherwise reach whoever runs
+      # the suite by hand. Drift between its prompt and the backend's copy is
+      # already asserted by test_orchestrator_intent.py in the `test` job.
+      - name: Byte-compile the standalone intent classifier
+        working-directory: intent-classifier
+        run: python3 -m compileall -q classify.py
 
   # ---------------------------------------------------------------------------
   # Tests: the unit suite, with the HTML reports attached to the run.
@@ -242,6 +266,64 @@ jobs:
           retention-days: 14
 
   # ---------------------------------------------------------------------------
+  # Frontend: typecheck and build the bundle that ships.
+  # ---------------------------------------------------------------------------
+  # There is no lint step and no unit-test step because the project has neither
+  # — `package.json` defines `dev`, `build`, `preview` and `typecheck`, and that
+  # is all. `typecheck` and `build` overlap (`build` is `tsc -b && vite build`)
+  # and both are here anyway: the separate typecheck reports a type error as a
+  # type error rather than as a failed build, and the build is what catches the
+  # thing tsc cannot see, such as an unresolvable import or a Tailwind/Vite
+  # plugin failure.
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          # 24 is what this was developed against. There is no .nvmrc and no
+          # `engines` field to read, so the version lives here; add one and this
+          # should read it instead.
+          node-version: "24"
+          # npm's own cache, keyed on the lockfile. Spelled from the repository
+          # root: an action's inputs ignore `working-directory`.
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # `npm ci`, not `npm install`: it installs the lockfile exactly and fails
+      # if package.json has drifted from it, which is the same guarantee
+      # `--frozen` gives uv in the Python jobs. It also deletes node_modules
+      # first, so nothing from a warm cache can mask a missing dependency.
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # VITE_USE_MOCKS is inlined at build time, and the default is false — the
+      # real-backend bundle is the one that ships, so that is the one built here.
+      - name: Build
+        run: npm run build
+
+      # The bundle, for a reviewer who wants to check a size regression without
+      # building it themselves. `always()` is pointless here: there is nothing
+      # to upload if the build failed.
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
   # Docker: prove the image still builds and still boots.
   # ---------------------------------------------------------------------------
   # Without this the gate can go green on a change that breaks the thing that
@@ -327,6 +409,53 @@ jobs:
         run: docker rm -f ll-smoke || true
 
   # ---------------------------------------------------------------------------
+  # E2E specs: collected, not run.
+  # ---------------------------------------------------------------------------
+  # `--list` loads every spec and reports what it would run, without starting a
+  # browser, a backend or a frontend. That makes it free and keyless, and it
+  # still catches the failure that matters most between full e2e runs: a spec
+  # that no longer compiles or imports, which otherwise surfaces only when
+  # someone runs the suite by hand and finds a file missing from the count.
+  #
+  # Expect: 73 tests in 9 files. The step asserts the file count rather than
+  # just exit zero, because `--list` succeeds on a half-collected suite.
+  #
+  # Actually running these needs a real key, a built frontend and a live
+  # backend, and cost $1.35 over 114 model calls when last measured — see
+  # docs/e2e-test-report.md. That belongs in a scheduled or dispatched workflow
+  # with a secret, not in a PR gate.
+  e2e-specs:
+    name: E2E specs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      # No `playwright install`: collection needs the test runner, not a
+      # browser. Skipping it is the difference between a ten-second job and a
+      # two-minute one.
+      - name: Install
+        run: npm ci
+
+      - name: Collect the specs
+        run: |
+          npx playwright test --list | tee /tmp/listing.txt
+          grep -qE "Total: [0-9]+ tests in 9 files" /tmp/listing.txt || {
+            echo "::error::expected 9 spec files; the suite did not collect in full"
+            exit 1
+          }
+
+  # ---------------------------------------------------------------------------
   # The single check to require in branch protection.
   # ---------------------------------------------------------------------------
   # A matrix job's name carries the matrix value ("Tests (py3.12)"), so requiring
@@ -337,16 +466,20 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [quality, test, docker]
+    needs: [quality, test, docker, frontend, e2e-specs]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require every upstream job to have succeeded
         run: |
-          echo "quality: ${{ needs.quality.result }}"
-          echo "test:    ${{ needs.test.result }}"
-          echo "docker:  ${{ needs.docker.result }}"
+          echo "quality:   ${{ needs.quality.result }}"
+          echo "test:      ${{ needs.test.result }}"
+          echo "docker:    ${{ needs.docker.result }}"
+          echo "frontend:  ${{ needs.frontend.result }}"
+          echo "e2e-specs: ${{ needs.e2e-specs.result }}"
           [ "${{ needs.quality.result }}" = "success" ] || exit 1
           [ "${{ needs.test.result }}" = "success" ] || exit 1
           [ "${{ needs.docker.result }}" = "success" ] || exit 1
+          [ "${{ needs.frontend.result }}" = "success" ] || exit 1
+          [ "${{ needs['e2e-specs'].result }}" = "success" ] || exit 1
           echo "All required checks passed."

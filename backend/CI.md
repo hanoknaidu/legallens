@@ -2,13 +2,18 @@
 
 Two workflows, both in `.github/workflows/` **at the repository root** — not
 under `backend/`, where they were first written. Actions only reads workflows
-from the root, so a workflow filed in a subdirectory never runs at all. `ci.yml` is the gate on `main`:
-ruff plus the unit suite on two interpreters, with a browsable HTML test report
-and coverage report attached to every run. `ci-retrieval.yml` carries the 21
-tests that load real models, which are too expensive to put on every PR.
+from the root, so a workflow filed in a subdirectory never runs at all.
+
+`ci.yml` is the gate on `main`: ruff and the unit suite on two interpreters, the
+production image built and booted, and the frontend typechecked and built — with
+a browsable HTML test report and coverage report attached to every run.
+`ci-retrieval.yml` carries the tests that load real models, which are too
+expensive to put on every PR.
 
 No secrets. Nothing in CI makes a network call to the vendor, so there is no
-`ANTHROPIC_API_KEY` in either workflow and nothing asks for one.
+`ANTHROPIC_API_KEY` in either workflow and nothing asks for one. That is a
+constraint on what can be gated, not an oversight — see
+[What is not gated](#what-is-not-gated).
 
 ## Scope: `backend/`, a subdirectory of the repository
 
@@ -42,10 +47,48 @@ opening the PR is what first exercises it.
 | `quality` | `ruff format --check` | yes — see [Formatting](#formatting) |
 | `test` (py3.12) | unit suite + coverage, the floor `pyproject.toml` declares | yes |
 | `test` (py3.14) | unit suite + coverage, what `.venv` and the Dockerfile run | yes |
+| `quality` | byte-compiles `intent-classifier/classify.py` | yes |
 | `docker` | builds the default image and boots it — see [Docker](#docker) | yes |
+| `frontend` | `npm ci`, `npm run typecheck`, `npm run build`; uploads the bundle | yes |
+| `e2e-specs` | `playwright test --list`, asserting 73 tests in 9 files | yes |
 | `ci` | one aggregate check to require in branch protection | yes |
 
-`quality`, `test` and `docker` run in parallel; `ci` waits on all three.
+The five run in parallel; `ci` waits on all of them. Each job sets its own
+`working-directory` — `backend/`, `frontend/` or `e2e/` — because no component
+sits at the repository root.
+
+### What is not gated
+
+Two things cannot run here, both for the same reason: they need a real
+`ANTHROPIC_API_KEY`.
+
+| Not gated | Why | What is checked instead |
+|---|---|---|
+| the e2e suite | needs a live backend, a built frontend and a key; cost $1.35 over 114 model calls when measured ([report](../docs/e2e-test-report.md)) | `--list` proves all 73 specs still load and collect |
+| `intent-classifier/classify.py` | every invocation is a vendor call | `python -m compileall` proves it still parses |
+
+A gate that needs a secret and spends money on every PR is a gate people turn
+off. The real cross-component assertions are in the unit suite instead:
+`test_conversation_titles.py` reads `frontend/src/lib/constants.ts` and
+`test_orchestrator_intent.py` reads `intent-classifier/intent_prompt.md`, so
+drift in either fails `test` without a key.
+
+Running the e2e suite for real belongs in a scheduled or dispatched workflow
+with a secret. It does not exist yet.
+
+### The frontend job
+
+`package.json` defines `dev`, `build`, `preview` and `typecheck` — there is no
+lint script and no unit-test script, so the job does not invent one. `typecheck`
+and `build` overlap, since `build` is `tsc -b && vite build`, and both run
+anyway: the separate typecheck reports a type error as a type error rather than
+as a failed build, and the build catches what tsc cannot see, such as an
+unresolvable import or a Vite plugin failure. `npm ci` is what gives the same
+lockfile guarantee `--frozen` gives uv.
+
+Node 24 is pinned in the workflow because there is no `.nvmrc` and no `engines`
+field to read. Adding one and having the workflow read it would be an
+improvement.
 
 ### Triggers
 
