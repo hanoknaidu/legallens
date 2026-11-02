@@ -8,7 +8,7 @@
 #     quality    read the backend source without running it (ruff lint+format)
 #     test       run the unit suite on py3.12 and py3.14, publish HTML reports
 #     docker     build the production image and prove it boots and reports ok
-#     frontend   typecheck and build the bundle that actually ships
+#     frontend   lint, typecheck and build the bundle that actually ships
 #     e2e-specs  prove the 73 Playwright specs still load and collect
 #        \__________________ all five ____________________/
 #                              |
@@ -268,9 +268,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # Frontend: typecheck and build the bundle that ships.
   # ---------------------------------------------------------------------------
-  # There is no lint step and no unit-test step because the project has neither
-  # — `package.json` defines `dev`, `build`, `preview` and `typecheck`, and that
-  # is all. `typecheck` and `build` overlap (`build` is `tsc -b && vite build`)
+  # There is no unit-test step because the project has none — `package.json`
+  # defines dev, build, preview, typecheck and lint, and that is all.
+  # `typecheck` and `build` overlap (`build` is `tsc -b && vite build`)
   # and both are here anyway: the separate typecheck reports a type error as a
   # type error rather than as a failed build, and the build is what catches the
   # thing tsc cannot see, such as an unresolvable import or a Tailwind/Vite
@@ -288,10 +288,11 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
-          # 24 is what this was developed against. There is no .nvmrc and no
-          # `engines` field to read, so the version lives here; add one and this
-          # should read it instead.
-          node-version: "24"
+          # From `.nvmrc` at the repository root rather than a literal here, so
+          # CI and `nvm use` cannot drift apart. It sits at the root, not in
+          # frontend/, because `e2e/` is a Node project too and nvm reads the
+          # nearest .nvmrc walking up from the working directory.
+          node-version-file: .nvmrc
           # npm's own cache, keyed on the lockfile. Spelled from the repository
           # root: an action's inputs ignore `working-directory`.
           cache: npm
@@ -303,6 +304,14 @@ jobs:
       # first, so nothing from a warm cache can mask a missing dependency.
       - name: Install
         run: npm ci
+
+      # The script carries `--max-warnings 9`, which is the count the repository
+      # had when ESLint was introduced. It is a ratchet, not a target: a tenth
+      # warning fails this job, and working one of the nine off means lowering
+      # the number. See the note in eslint.config.js for what the nine are and
+      # why they are warnings rather than errors.
+      - name: Lint
+        run: npm run lint
 
       - name: Typecheck
         run: npm run typecheck
@@ -437,7 +446,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: e2e/package-lock.json
 

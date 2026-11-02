@@ -49,7 +49,7 @@ opening the PR is what first exercises it.
 | `test` (py3.14) | unit suite + coverage, what `.venv` and the Dockerfile run | yes |
 | `quality` | byte-compiles `intent-classifier/classify.py` | yes |
 | `docker` | builds the default image and boots it — see [Docker](#docker) | yes |
-| `frontend` | `npm ci`, `npm run typecheck`, `npm run build`; uploads the bundle | yes |
+| `frontend` | `npm ci`, `npm run lint`, `npm run typecheck`, `npm run build`; uploads the bundle | yes |
 | `e2e-specs` | `playwright test --list`, asserting 73 tests in 9 files | yes |
 | `ci` | one aggregate check to require in branch protection | yes |
 
@@ -78,17 +78,47 @@ with a secret. It does not exist yet.
 
 ### The frontend job
 
-`package.json` defines `dev`, `build`, `preview` and `typecheck` — there is no
-lint script and no unit-test script, so the job does not invent one. `typecheck`
-and `build` overlap, since `build` is `tsc -b && vite build`, and both run
-anyway: the separate typecheck reports a type error as a type error rather than
-as a failed build, and the build catches what tsc cannot see, such as an
-unresolvable import or a Vite plugin failure. `npm ci` is what gives the same
-lockfile guarantee `--frozen` gives uv.
+`package.json` defines `dev`, `build`, `preview`, `typecheck` and `lint`. There
+is still no unit-test script, so the job does not invent one. `typecheck` and
+`build` overlap, since `build` is `tsc -b && vite build`, and both run anyway:
+the separate typecheck reports a type error as a type error rather than as a
+failed build, and the build catches what tsc cannot see, such as an unresolvable
+import or a Vite plugin failure. `npm ci` is what gives the same lockfile
+guarantee `--frozen` gives uv.
 
-Node 24 is pinned in the workflow because there is no `.nvmrc` and no `engines`
-field to read. Adding one and having the workflow read it would be an
-improvement.
+Node comes from `.nvmrc` at the repository root via `node-version-file`, so CI
+and `nvm use` cannot drift. It is at the root rather than in `frontend/` because
+`e2e/` is a Node project too, and nvm reads the nearest `.nvmrc` walking up from
+the working directory — one file serves both.
+
+#### ESLint, and the warning ratchet
+
+Flat config in `frontend/eslint.config.js`: ESLint 10, typescript-eslint,
+`react-hooks` and `react-refresh`. Type-aware linting is deliberately off —
+`tsc -b --noEmit` already runs with `strict`, `noUnusedLocals`,
+`noUnusedParameters` and `noFallthroughCasesInSwitch`, so reading the program
+again in ESLint would re-report what tsc reports, several times slower. ESLint
+covers what tsc does not look at: hook rules and fast-refresh boundaries.
+
+The `lint` script is `eslint . --max-warnings 9`. Nine is the count the
+repository had the day ESLint went in — **a ratchet, not a target**. A tenth
+warning fails the job; working one of the nine off means lowering the number.
+
+The nine, all pre-existing:
+
+| Count | Rule | Where |
+|---|---|---|
+| 6 | `react-hooks/set-state-in-effect` | `useMediaQuery`, `PageToolbar`, `CommandPalette`, `TopBar`, `ChatPage` |
+| 3 | `react-refresh/only-export-components` | `Highlight.tsx`, `IngestStatus.tsx` |
+
+They are warnings rather than errors because fixing them is a behaviour change,
+not a lint fix. `useMediaQuery` re-reads `matchMedia` inside its effect to cover
+the query changing between render and effect — the rule objects to exactly the
+line that exists to handle that case. The react-refresh three are helper
+functions (`spanPattern`, `findSpan`, `STATUS_META`) exported beside a
+component, which costs fast refresh in dev and nothing in production. Reworking
+five components' state synchronisation, in a codebase with no frontend unit
+tests, is its own task with its own review.
 
 ### Triggers
 
