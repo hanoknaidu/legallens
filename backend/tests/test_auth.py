@@ -581,7 +581,11 @@ async def test_health_says_whether_sign_in_is_open(anon_client: AsyncClient) -> 
 @pytest_asyncio.fixture
 async def strict_client(tmp_path) -> AsyncIterator[tuple[FastAPI, AsyncClient]]:
     settings = Settings(
-        environment="test", data_dir=tmp_path, llm_provider="echo", open_signin=False
+        environment="test",
+        data_dir=tmp_path,
+        llm_provider="echo",
+        require_auth=True,
+        open_signin=False,
     )
     app = create_app(settings)
     async with (
@@ -617,3 +621,91 @@ async def test_strict_mode_says_so_on_health(
     _, client = strict_client
     checks = (await client.get("/health")).json()["checks"]
     assert checks["auth"] == "ok (accounts created by an operator)"
+
+
+# ---------------------------------------------------------------------------
+# Showcase build (`LEGAL_LENS_REQUIRE_AUTH=false`, the shipped default)
+# ---------------------------------------------------------------------------
+# The login page is a demonstration of the flow and nothing checks a cookie. These
+# exist so that turning the flag back on is a supported transition rather than a
+# hope, and so the build announces itself rather than looking like the real thing.
+
+
+@pytest_asyncio.fixture
+async def showcase_client(tmp_path) -> AsyncIterator[tuple[FastAPI, AsyncClient]]:
+    # No `require_auth` argument: this is the shipped default, and spelling it out
+    # here would hide a change to that default from these tests.
+    settings = Settings(environment="test", data_dir=tmp_path, llm_provider="echo")
+    assert settings.require_auth is False
+    app = create_app(settings)
+    async with (
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://test/api") as client,
+        app.router.lifespan_context(app),
+    ):
+        yield app, client
+
+
+async def test_the_showcase_build_serves_every_route_without_a_session(
+    showcase_client: tuple[FastAPI, AsyncClient],
+) -> None:
+    """What makes the demo transition land on a working app rather than a 401 loop."""
+    _, client = showcase_client
+    for path in ("/matters", "/conversations", "/documents", "/audit"):
+        assert (await client.get(path)).status_code == 200, path
+
+
+async def test_the_showcase_build_attributes_requests_to_the_phase_one_owner(
+    showcase_client: tuple[FastAPI, AsyncClient],
+) -> None:
+    """So a showcase build shows the data a pre-authentication build showed, rather
+    than an empty library belonging to nobody."""
+    _, client = showcase_client
+    me = await client.get("/auth/me")
+    assert me.status_code == 200
+    assert me.json()["id"] == PHASE1_OWNER_ID
+
+
+async def test_the_showcase_build_says_so_on_health(
+    showcase_client: tuple[FastAPI, AsyncClient],
+) -> None:
+    """Answerable from outside the deployment. A showcase build left running
+    somewhere real is the mistake this is here to catch."""
+    _, client = showcase_client
+    checks = (await client.get("/health")).json()["checks"]
+    assert "SHOWCASE BUILD" in checks["auth"]
+
+
+async def test_the_showcase_build_tells_the_client_not_to_enforce(
+    showcase_client: tuple[FastAPI, AsyncClient],
+) -> None:
+    """`authRequired` is what the frontend reads to decide whether Sign In is a
+    credential exchange or a transition."""
+    _, client = showcase_client
+    body = (await client.get("/auth/session")).json()
+    assert body["authRequired"] is False
+
+
+async def test_the_real_build_reports_auth_required(
+    strict_client: tuple[FastAPI, AsyncClient],
+) -> None:
+    _, client = strict_client
+    assert (await client.get("/auth/session")).json()["authRequired"] is True
+
+
+async def test_a_real_session_still_wins_in_a_showcase_build(
+    showcase_client: tuple[FastAPI, AsyncClient],
+) -> None:
+    """Turning the flag on mid-session must not sign anybody out, so a present cookie
+    is honoured even when nothing requires one."""
+    app, client = showcase_client
+    await app.state.services.auth.create_user(
+        email=SECOND_EMAIL, name="B", password=SECOND_PASSWORD
+    )
+    await client.post("/auth/signin", json={"email": SECOND_EMAIL, "password": SECOND_PASSWORD})
+
+    me = await client.get("/auth/me")
+    # The signed-in user, not the demo stand-in. Identified by email rather than by
+    # id: this is the first account in a fresh database, so it adopts `owner-local`
+    # too — which is the same id the demo user carries, and therefore proves nothing.
+    assert me.json()["email"] == SECOND_EMAIL
+    assert me.json()["name"] == "B"

@@ -119,7 +119,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # through a 50MB POST. /health probes it instead.
     settings.objects_path.mkdir(parents=True, exist_ok=True)
 
-    if settings.open_signin:
+    if not settings.require_auth:
+        # The loudest line this service logs. A showcase build has no access control
+        # whatsoever, and the way that becomes a real problem is by being forgotten.
+        log.warning(
+            "SHOWCASE BUILD: authentication is NOT enforced — every request is the demo user",
+            extra={
+                "setting": "LEGAL_LENS_REQUIRE_AUTH",
+                "consequence": "anyone who can reach this service can read and upload documents",
+                "enable_with": "LEGAL_LENS_REQUIRE_AUTH=true",
+            },
+        )
+    elif settings.open_signin:
         # Loud, every boot, and a warning rather than info. An open document library
         # is a deliberate configuration, and the failure mode of a deliberate
         # configuration is that everyone forgets it is set.
@@ -136,6 +147,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "service started",
         extra={
             "environment": settings.environment,
+            "require_auth": settings.require_auth,
             "open_signin": settings.open_signin,
             "db": str(settings.db_path),
             "llm_provider": settings.llm_provider,

@@ -10,7 +10,35 @@ constant and now resolves a session cookie; every router that already took `Owne
 became authenticated without being edited, because every query was already filtering
 on the value it returns.
 
-## What it is
+## The shipped default is a showcase build
+
+**`LEGAL_LENS_REQUIRE_AUTH` is off.** The login page is a demonstration of the flow:
+Sign In is a transition into the chat, no credentials are checked, nothing is sent,
+and no API route requires a session. Every request is attributed to the single Phase 1
+owner — which is exactly how the service behaved before authentication existed, so the
+app behind the demo is fully working rather than an empty shell.
+
+The gate that makes the login page appear at all is a `sessionStorage` flag
+(`frontend/src/lib/demoSession.ts`). It is not a credential and protects nothing; it
+exists so "signed in" is a state the demo can enter and leave, and so the transition
+can be shown more than once per tab.
+
+A showcase build announces itself three ways, because one left running somewhere real
+is the mistake worth catching:
+
+- a `WARNING` at every boot — `SHOWCASE BUILD: authentication is NOT enforced`
+- `/api/health` → `"auth": "ok (SHOWCASE BUILD: no sign-in required, …)"`
+- the login page itself — "Demonstration — sign in with anything to continue."
+
+Everything below describes what `LEGAL_LENS_REQUIRE_AUTH=true` turns on. It is
+implemented and tested, not a sketch: sessions, hashing, throttling, per-user
+isolation and the 401s all come back with nothing else to change.
+
+```bash
+LEGAL_LENS_REQUIRE_AUTH=true     # the real thing
+```
+
+## What it is, with authentication on
 
 Email and password, verified against a server-side session.
 
@@ -161,9 +189,11 @@ Stated rather than papered over.
    expiry — a feature, not an omission to fix in passing.
 5. **No MFA, no password history, no rotation policy.** All reasonable asks for a
    firm handling privileged material, and all out of scope here.
-6. **Open sign-in is on by default** (above), which trades away enumeration
+6. **The e2e suite needs the real build.** `e2e/global-setup.ts` refuses to run
+   against a showcase build rather than producing 79 failures that say nothing.
+7. **Open sign-in is on by default** when authentication is on, which trades away enumeration
    resistance and means the service is self-service unless configured otherwise.
-7. **Sign-in events go to the log, not to `audit_log`.** That table's shape is
+8. **Sign-in events go to the log, not to `audit_log`.** That table's shape is
    per-generation (FR-20: feature, tokens, cost, grounding). Bending it to hold
    authentication events would make both harder to read.
 
@@ -181,7 +211,8 @@ cleaner and orphans everything already uploaded.
 
 ## Tests
 
-`backend/tests/test_auth.py`, 43 tests, including both sign-in modes — the open-mode
+`backend/tests/test_auth.py`, 49 tests, covering all three postures — showcase,
+open sign-in and operator-created accounts — including both sign-in modes — the open-mode
 boundaries above, and a `strict_client` fixture that pins the byte-identical replies
 `open_signin=false` restores. The one that justifies the rest:
 `test_one_user_cannot_see_another_users_documents` drives two real sessions through

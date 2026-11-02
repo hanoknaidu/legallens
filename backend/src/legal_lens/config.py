@@ -191,6 +191,23 @@ class Settings(BaseSettings):
     #: minutes of waiting to prove nothing about the hash parameters.
     scrypt_n: int | None = None
 
+    #: Whether the API actually requires a session.
+    #:
+    #: **Off by default: this is a showcase build.** The login page is a demonstration
+    #: of the flow, the Sign In button is a transition into the app, and no route
+    #: checks a cookie. Every request is attributed to the single Phase 1 owner, which
+    #: is exactly how the service behaved before authentication existed.
+    #:
+    #: The implementation behind it is real and tested — set `true` and sign-in,
+    #: sessions, per-user isolation and the 401s all come back with nothing else to
+    #: change. That is the point of leaving it as a flag rather than deleting the
+    #: code: a demo that cannot become the real thing is a rewrite waiting to happen.
+    #:
+    #: Never leave this off anywhere real. With it off there is no access control at
+    #: all, and the BRD classes what is stored here as privileged attorney-client
+    #: material (§8.2).
+    require_auth: bool = False
+
     #: Let an unrecognised email sign in, creating the account on the spot with the
     #: password submitted.
     #:

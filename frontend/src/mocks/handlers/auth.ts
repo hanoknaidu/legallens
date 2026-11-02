@@ -4,6 +4,11 @@ import type { SessionUser } from "@/types/domain";
 /**
  * The mock layer's session.
  *
+ * `authRequired: true` on purpose, even though the shipped backend default is a
+ * showcase build: the mock path exists to exercise the real flow against fixtures,
+ * and reporting a showcase build here would make the login form a transition and
+ * leave the credential handling untested in the one mode that can be run offline.
+ *
  * `VITE_USE_MOCKS=true` is the only path with demo content, and it has no backend to
  * hold a cookie — so the session lives in a module variable here. It starts *signed
  * out*, so the mock path exercises the login screen rather than skipping it: a sign-in
@@ -34,7 +39,7 @@ export const authHandlers = [
   // `openSignin: true` mirrors the backend default, so the mock login page shows the
   // same hint the real one does.
   http.get("/api/auth/session", () =>
-    HttpResponse.json({ user: signedIn ? DEMO_USER : null, openSignin: true }),
+    HttpResponse.json({ user: signedIn ? DEMO_USER : null, openSignin: true, authRequired: true }),
   ),
 
   http.post("/api/auth/signin", async ({ request }) => {
@@ -45,7 +50,7 @@ export const authHandlers = [
       return problem(401, "Sign-in failed", "Email or password is incorrect.", "invalid_credentials");
     }
     signedIn = true;
-    return HttpResponse.json({ user: { ...DEMO_USER, email }, openSignin: true });
+    return HttpResponse.json({ user: { ...DEMO_USER, email }, openSignin: true, authRequired: true });
   }),
 
   http.post("/api/auth/signout", () => {

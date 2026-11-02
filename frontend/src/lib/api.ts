@@ -156,9 +156,11 @@ export const api = {
   auth: {
     /** Who is signed in, or `{ user: null }`. A 200 either way — see the backend route. */
     session: () =>
-      request<{ user: SessionUser | null; openSignin: boolean }>("/auth/session"),
+      request<{ user: SessionUser | null; openSignin: boolean; authRequired: boolean }>(
+        "/auth/session",
+      ),
     signIn: (body: { email: string; password: string }) =>
-      request<{ user: SessionUser; openSignin: boolean }>("/auth/signin", {
+      request<{ user: SessionUser; openSignin: boolean; authRequired: boolean }>("/auth/signin", {
         method: "POST",
         body: JSON.stringify(body),
       }),

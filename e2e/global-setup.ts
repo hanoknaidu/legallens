@@ -66,6 +66,22 @@ export default async function globalSetup() {
   // through the form keeps that one flow under test in `10-auth.spec.ts` instead of
   // repeated 73 times as setup.
   // ---------------------------------------------------------------------
+  // These specs drive the authenticated app: they assert 401s, sign-in failures and
+  // per-user isolation, none of which exist in a showcase build. Running them against
+  // one produces a wall of failures that say nothing about the app, so it stops here
+  // instead — the same policy as the checks above.
+  const session = await ctx.get(`${API}/api/auth/session`, { timeout: 10_000 });
+  const authRequired = Boolean((await session.json()).authRequired);
+  if (!authRequired) {
+    throw new Error(
+      "The backend is a showcase build (LEGAL_LENS_REQUIRE_AUTH=false), where no " +
+        "route requires a session.\n\n" +
+        "These tests drive the authenticated app. Start the backend with:\n\n" +
+        "  cd backend && LEGAL_LENS_REQUIRE_AUTH=true \\\n" +
+        "    LEGAL_LENS_LLM_PROVIDER=orchestrator uv run uvicorn legal_lens.main:app --port 8000\n",
+    );
+  }
+
   if (!PASSWORD) {
     throw new Error(
       "E2E_PASSWORD is not set, and the app needs a session.\n\n" +

@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { ApiError } from "@/lib/api";
 import { useSession, useSignIn } from "@/hooks/useSession";
+import { setDemoSignedIn } from "@/lib/demoSession";
 
 /**
  * Sign-in.
@@ -24,7 +25,7 @@ import { useSession, useSignIn } from "@/hooks/useSession";
  *   from either field without extra key handling.
  */
 export function LoginPage() {
-  const { user, openSignin, isLoading: sessionLoading } = useSession();
+  const { user, openSignin, authRequired, isLoading: sessionLoading } = useSession();
   const signIn = useSignIn();
   const navigate = useNavigate();
   const location = useLocation();
@@ -33,6 +34,11 @@ export function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [revealed, setRevealed] = useState(false);
+  //: The showcase build's "signing in…" state. The real build reads this from the
+  //: mutation; here there is no request to be pending, so it is held locally and the
+  //: pause is deliberate — an instant jump reads as a broken link rather than a
+  //: sign-in.
+  const [demoPending, setDemoPending] = useState(false);
 
   // Where the guard was trying to send them before it found no session.
   const from = (location.state as { from?: string } | null)?.from ?? "/chat/new";
@@ -42,8 +48,9 @@ export function LoginPage() {
   }, []);
 
   // Already signed in — arriving here from a bookmark, or in a second tab. Nothing to
-  // ask, so nothing is shown.
-  if (!sessionLoading && user) return <Navigate to={from} replace />;
+  // ask, so nothing is shown. Only in the real build: in the showcase build the whole
+  // point is to arrive here, so it never redirects away on its own.
+  if (!sessionLoading && authRequired && user) return <Navigate to={from} replace />;
 
   const failure = signIn.error;
   const message =
@@ -53,9 +60,23 @@ export function LoginPage() {
         ? "Could not reach the server. Check your connection and try again."
         : null;
 
+  const pending = authRequired ? signIn.isPending : demoPending;
+
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
-    if (!email.trim() || !password || signIn.isPending) return;
+    if (pending) return;
+
+    if (!authRequired) {
+      // Showcase build: no credentials are checked and nothing is sent. The short
+      // pause is the transition — long enough to read as a sign-in, short enough not
+      // to feel like waiting.
+      setDemoPending(true);
+      setDemoSignedIn(true);
+      window.setTimeout(() => navigate(from, { replace: true }), 450);
+      return;
+    }
+
+    if (!email.trim() || !password) return;
     signIn.mutate(
       { email: email.trim(), password },
       {
@@ -110,7 +131,7 @@ export function LoginPage() {
                 autoCapitalize="none"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                disabled={signIn.isPending}
+                disabled={pending}
                 aria-invalid={message ? true : undefined}
                 placeholder="you@firm.com"
               />
@@ -129,7 +150,7 @@ export function LoginPage() {
                   required
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  disabled={signIn.isPending}
+                  disabled={pending}
                   aria-invalid={message ? true : undefined}
                   className="pr-10"
                 />
@@ -159,9 +180,12 @@ export function LoginPage() {
             variant="primary"
             size="lg"
             className="mt-6 w-full"
-            disabled={signIn.isPending || !email.trim() || !password}
+            // In the showcase build the button is always live: there is nothing to
+            // validate, and a demo whose primary control starts disabled invites the
+            // visitor to conclude it is broken.
+            disabled={pending || (authRequired && (!email.trim() || !password))}
           >
-            {signIn.isPending ? (
+            {pending ? (
               <>
                 <Loader2 className="size-4 animate-spin" aria-hidden />
                 Signing in…
@@ -178,9 +202,11 @@ export function LoginPage() {
             build-time constant, so this cannot tell half of all deployments the wrong
             thing. */}
         <p className="mt-5 text-center text-caption text-ink-subtle">
-          {openSignin
-            ? "New here? Signing in creates your account."
-            : "Accounts are created by your administrator."}
+          {!authRequired
+            ? "Demonstration — sign in with anything to continue."
+            : openSignin
+              ? "New here? Signing in creates your account."
+              : "Accounts are created by your administrator."}
         </p>
       </div>
     </main>

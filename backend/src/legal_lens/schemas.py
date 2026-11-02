@@ -377,3 +377,7 @@ class SessionResponse(Wire):
     #: account what to do, instead of hardcoding one of the two answers and being
     #: wrong in whichever deployment is configured the other way.
     open_signin: bool = False
+    #: Whether the API enforces sessions at all (`LEGAL_LENS_REQUIRE_AUTH`). False in
+    #: a showcase build, where the login page is a demonstration of the flow and the
+    #: frontend treats Sign In as a transition rather than a credential exchange.
+    auth_required: bool = True

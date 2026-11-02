@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { setDemoSignedIn } from "@/lib/demoSession";
 import type { SessionUser } from "@/types/domain";
 
 export const SESSION_KEY = ["auth", "session"] as const;
@@ -29,6 +30,13 @@ export function useSession() {
      * page that guessed would tell half of all deployments the wrong thing.
      */
     openSignin: query.data?.openSignin ?? false,
+    /**
+     * Whether the server enforces sessions at all. `false` is a showcase build: the
+     * login page is a demonstration and Sign In is a transition, not a credential
+     * exchange. Defaulting to `true` while the query is in flight is the safe way
+     * round — it withholds the app for one request rather than flashing it.
+     */
+    authRequired: query.data?.authRequired ?? true,
     isLoading: query.isPending,
     isError: query.isError,
     refetch: query.refetch,
@@ -50,7 +58,15 @@ export function useSignIn() {
 export function useSignOut() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: () => api.auth.signOut(),
+    mutationFn: async () => {
+      // Clearing the demo flag unconditionally: in the real build it is unset
+      // already, and in the showcase build it is the only thing that "signed in"
+      // ever meant. Doing it here rather than in `onSuccess` means it happens even
+      // if the request fails, which is the behaviour someone pressing Sign out
+      // wants.
+      setDemoSignedIn(false);
+      await api.auth.signOut();
+    },
     onSuccess: () => {
       // Order matters, and `queryClient.clear()` cannot be used here.
       //

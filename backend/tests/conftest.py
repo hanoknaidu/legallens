@@ -27,7 +27,10 @@ TEST_NAME = "Test Attorney"
 def settings(tmp_path: Path) -> Settings:
     # A real file rather than :memory:, because the connection is opened once at
     # lifespan and an in-memory database would not survive the way the app uses it.
-    return Settings(environment="test", data_dir=tmp_path, llm_provider="echo")
+    # `require_auth=True` explicitly: the shipped default is a showcase build with no
+    # enforcement, and a suite that inherited that would assert nothing about the 401s
+    # it is here to check. The demo path has its own tests, which opt back out.
+    return Settings(environment="test", data_dir=tmp_path, llm_provider="echo", require_auth=True)
 
 
 @pytest.fixture
