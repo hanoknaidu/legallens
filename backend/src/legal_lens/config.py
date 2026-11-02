@@ -191,6 +191,24 @@ class Settings(BaseSettings):
     #: minutes of waiting to prove nothing about the hash parameters.
     scrypt_n: int | None = None
 
+    #: Let an unrecognised email sign in, creating the account on the spot with the
+    #: password submitted.
+    #:
+    #: **This makes the document library self-service.** Anyone who can reach the
+    #: service gets an account, and the BRD classes what is stored here as privileged
+    #: attorney-client material (§8.2). It also gives up the enumeration resistance
+    #: the sign-in route otherwise has: a new address is told its password is too
+    #: short, while a known address is told the credentials are wrong, and the two
+    #: replies are distinguishable.
+    #:
+    #: What it does *not* do: let anyone into an account that already exists. An email
+    #: with an account still needs that account's password, and a disabled account
+    #: stays disabled.
+    #:
+    #: Set `false` to go back to accounts being created only by `auth.cli` or by
+    #: first-run bootstrap.
+    open_signin: bool = True
+
     #: First-run bootstrap, for a container that has no shell to run the CLI in. Both
     #: must be set, and they are used only when the users table is empty — so leaving
     #: them in the environment does not reset anybody's password on the next restart.

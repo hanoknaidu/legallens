@@ -31,8 +31,10 @@ function problem(status: number, title: string, detail: string, code: string) {
 }
 
 export const authHandlers = [
+  // `openSignin: true` mirrors the backend default, so the mock login page shows the
+  // same hint the real one does.
   http.get("/api/auth/session", () =>
-    HttpResponse.json({ user: signedIn ? DEMO_USER : null }),
+    HttpResponse.json({ user: signedIn ? DEMO_USER : null, openSignin: true }),
   ),
 
   http.post("/api/auth/signin", async ({ request }) => {
@@ -43,7 +45,7 @@ export const authHandlers = [
       return problem(401, "Sign-in failed", "Email or password is incorrect.", "invalid_credentials");
     }
     signedIn = true;
-    return HttpResponse.json({ user: { ...DEMO_USER, email } });
+    return HttpResponse.json({ user: { ...DEMO_USER, email }, openSignin: true });
   }),
 
   http.post("/api/auth/signout", () => {

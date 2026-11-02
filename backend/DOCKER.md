@@ -107,6 +107,7 @@ the three uvicorn settings and `ANTHROPIC_API_KEY`.
 | `LEGAL_LENS_ENVIRONMENT` | `prod` | `prod` disables `/api/docs` and `/api/openapi.json`. Use `dev` to get them. |
 | `LEGAL_LENS_LOG_LEVEL` | `INFO` | |
 | `LEGAL_LENS_LLM_PROVIDER` | `anthropic` | `anthropic` \| `echo` \| `orchestrator` |
+| `LEGAL_LENS_OPEN_SIGNIN` | `true` | **Any email that signs in gets an account.** Set `false` for anything reachable beyond a laptop — see [docs/auth.md](../docs/auth.md). Reported by `/api/health` and warned about at every boot. |
 | `LEGAL_LENS_BOOTSTRAP_EMAIL` | — | With the next one, creates the first account at startup — only if there are no users. See [docs/auth.md](../docs/auth.md). Without an account nobody can sign in, and a container has no shell for the CLI. |
 | `LEGAL_LENS_BOOTSTRAP_PASSWORD` | — | At least 12 characters. |
 | `LEGAL_LENS_SESSION_TTL_SECONDS` | `28800` | Idle timeout, slid forward on every authenticated request. |

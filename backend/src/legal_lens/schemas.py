@@ -372,3 +372,8 @@ class SessionResponse(Wire):
     answer "no" is not an error."""
 
     user: SessionUser | None = None
+    #: Whether an unrecognised email may sign in and get an account
+    #: (`LEGAL_LENS_OPEN_SIGNIN`). Here so the login page can tell someone without an
+    #: account what to do, instead of hardcoding one of the two answers and being
+    #: wrong in whichever deployment is configured the other way.
+    open_signin: bool = False

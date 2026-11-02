@@ -5,7 +5,7 @@ The rules this file enforces, each of which is a decision rather than a default:
 * **One failure message.** A wrong password, an unknown address and a disabled
   account all return `invalid_credentials`. Which of the three it was is in the log,
   not in the response: for a legal product, "does this person have an account here?"
-  is itself privileged (BRD §8.2).
+  is itself privileged (BRD §8.2). `open_signin` weakens this — see `config.py`.
 * **A fixed cost per attempt.** A missing account still pays for one scrypt verify
   against `dummy_hash`, so response time does not answer that question either.
 * **A new token per sign-in.** Never reuse or extend the caller's existing cookie —
@@ -58,11 +58,13 @@ class AuthService:
         *,
         session_ttl_seconds: int,
         scrypt_n: int,
+        open_signin: bool = False,
         throttle: SignInThrottle | None = None,
     ) -> None:
         self._users = users
         self._ttl = session_ttl_seconds
         self._scrypt_n = scrypt_n
+        self._open_signin = open_signin
         self.throttle = throttle or SignInThrottle()
 
     # -- accounts -----------------------------------------------------------
@@ -133,6 +135,30 @@ class AuthService:
             )
 
         user = await self._users.by_email(email)
+
+        if user is None and self._open_signin:
+            # Self-service sign-up, through the sign-in form (`open_signin`). The
+            # password submitted becomes the account's password, so the second visit
+            # is an ordinary sign-in and a typo on the first visit is a new account
+            # rather than a lockout.
+            #
+            # Deliberately only when `user is None`: an existing account — including a
+            # disabled one — still falls through to the checks below, so this cannot
+            # be used to walk into somebody else's library by typing their address.
+            user = await self.create_user(email=email, name=email.split("@")[0], password=password)
+            self.throttle.record_success(throttle_key)
+            token = new_session_token()
+            await self._users.create_session(
+                token_hash=token_hash(token),
+                user_id=user.id,
+                ttl_seconds=self._ttl,
+                user_agent=user_agent,
+                ip=ip,
+            )
+            await self._users.touch_login(user.id)
+            log.info("account created at sign-in", extra={"user_id": user.id})
+            return user, token
+
         if user is None or not user.is_active:
             # Pay the cost anyway — see the module docstring.
             verify_password(password, dummy_hash(self._scrypt_n))

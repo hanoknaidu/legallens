@@ -71,12 +71,13 @@ async def sign_in(
     # A first sign-in on a fresh database has no matter to put documents in.
     await services.bootstrap_owner(user.id)
     return SessionResponse(
+        open_signin=settings.open_signin,
         user=SessionUser(
             id=user.id,
             email=user.email,
             name=user.name,
             expires_at=utcnow() + timedelta(seconds=settings.session_ttl_seconds),
-        )
+        ),
     )
 
 
@@ -104,14 +105,15 @@ async def current_session(
     """
     user = await services.auth.resolve(session_token(request))
     if user is None:
-        return SessionResponse(user=None)
+        return SessionResponse(user=None, open_signin=settings.open_signin)
     return SessionResponse(
+        open_signin=settings.open_signin,
         user=SessionUser(
             id=user.id,
             email=user.email,
             name=user.name,
             expires_at=utcnow() + timedelta(seconds=settings.session_ttl_seconds),
-        )
+        ),
     )
 
 

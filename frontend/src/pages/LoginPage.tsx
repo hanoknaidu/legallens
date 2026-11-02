@@ -24,7 +24,7 @@ import { useSession, useSignIn } from "@/hooks/useSession";
  *   from either field without extra key handling.
  */
 export function LoginPage() {
-  const { user, isLoading: sessionLoading } = useSession();
+  const { user, openSignin, isLoading: sessionLoading } = useSession();
   const signIn = useSignIn();
   const navigate = useNavigate();
   const location = useLocation();
@@ -172,11 +172,15 @@ export function LoginPage() {
           </Button>
         </form>
 
-        {/* There is no sign-up link because there is no sign-up route: accounts are
-            created by whoever runs the service (docs/auth.md). Saying so is
-            better than leaving someone hunting for a button that does not exist. */}
+        {/* There is no separate sign-up link in either mode: with open sign-in this
+            form *is* the sign-up, and without it there is nothing to link to. Which
+            of the two is true comes from the server (docs/auth.md) rather than from a
+            build-time constant, so this cannot tell half of all deployments the wrong
+            thing. */}
         <p className="mt-5 text-center text-caption text-ink-subtle">
-          Accounts are created by your administrator.
+          {openSignin
+            ? "New here? Signing in creates your account."
+            : "Accounts are created by your administrator."}
         </p>
       </div>
     </main>

@@ -48,6 +48,9 @@ services:
       # cannot reset an existing password. Override before first boot, or create
       # further accounts with
       #   docker compose exec backend python -m legal_lens.auth.cli create you@firm.com
+      # Any email that signs in gets an account. Convenient locally; for anything
+      # reachable beyond this machine set it false and use `auth.cli create`.
+      LEGAL_LENS_OPEN_SIGNIN: "${LEGAL_LENS_OPEN_SIGNIN:-true}"
       LEGAL_LENS_BOOTSTRAP_EMAIL: "${LEGAL_LENS_BOOTSTRAP_EMAIL:-attorney@firm.test}"
       LEGAL_LENS_BOOTSTRAP_PASSWORD: "${LEGAL_LENS_BOOTSTRAP_PASSWORD:-change-this-password}"
     volumes:

@@ -58,6 +58,7 @@ class Services:
             self.users,
             session_ttl_seconds=settings.session_ttl_seconds,
             scrypt_n=settings.password_scrypt_n,
+            open_signin=settings.open_signin,
         )
 
         # Retrieval. `embedder_for` raises on an unimplemented provider rather than

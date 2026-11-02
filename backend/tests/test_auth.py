@@ -9,18 +9,22 @@ another's documents, which is the whole point of the owner column.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 import pytest
+import pytest_asyncio
 from fastapi import FastAPI
-from httpx import AsyncClient
+from httpx import ASGITransport, AsyncClient
 
 from conftest import TEST_EMAIL, TEST_PASSWORD
 from fixtures import text_pdf
 from helpers import MSA_PAGES
 from legal_lens.auth.passwords import hash_password, token_hash, verify_password
 from legal_lens.auth.throttle import SignInThrottle
-from legal_lens.config import PHASE1_OWNER_ID
+from legal_lens.config import PHASE1_OWNER_ID, Settings
 from legal_lens.db.repositories.users import UserRepository
 from legal_lens.errors import ApiProblem
+from legal_lens.main import create_app
 
 SECOND_EMAIL = "opposing@counsel.test"
 SECOND_PASSWORD = "a-different-long-password"
@@ -105,26 +109,22 @@ async def test_the_session_cookie_is_secure_in_prod(tmp_path) -> None:
         assert "Secure" in response.headers["set-cookie"]
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"email": TEST_EMAIL, "password": "wrong-password-entirely"},
-        {"email": "nobody@firm.test", "password": TEST_PASSWORD},
-    ],
-    ids=["wrong password", "no such account"],
-)
-async def test_every_sign_in_failure_looks_identical(
-    app: FastAPI, anon_client: AsyncClient, payload: dict[str, str]
+async def test_a_wrong_password_is_refused_without_detail(
+    app: FastAPI, anon_client: AsyncClient
 ) -> None:
-    """A wrong password and an unknown address must be indistinguishable.
+    """The message never says *which* part was wrong.
 
-    Otherwise the endpoint answers "is this person a client of this firm?", which for
-    a legal product is itself privileged (BRD §8.2).
+    Under `open_signin=False` an unknown address gets this same reply, so the endpoint
+    cannot be used to ask "is this person a client of this firm?" — which for a legal
+    product is itself privileged (BRD §8.2). See
+    `test_strict_mode_refuses_an_unknown_address`.
     """
     await app.state.services.auth.create_user(
         email=TEST_EMAIL, name="Test Attorney", password=TEST_PASSWORD
     )
-    response = await anon_client.post("/auth/signin", json=payload)
+    response = await anon_client.post(
+        "/auth/signin", json={"email": TEST_EMAIL, "password": "wrong-password-entirely"}
+    )
 
     assert response.status_code == 401
     body = response.json()
@@ -420,9 +420,13 @@ async def test_a_short_password_is_refused(app: FastAPI, anon_client: AsyncClien
     assert caught.value.code == "password_too_short"
 
 
-async def test_there_is_no_public_sign_up_route(anon_client: AsyncClient) -> None:
-    """Accounts are created by an operator (`auth.cli`) or by first-run bootstrap. A
-    firm's document library is not something a stranger joins."""
+async def test_there_is_no_separate_sign_up_route(anon_client: AsyncClient) -> None:
+    """There is one way in, and it is `/auth/signin`.
+
+    With `open_signin` on, that route also provisions; with it off, accounts come from
+    `auth.cli` or first-run bootstrap. Either way there is no second endpoint with its
+    own rules to keep in step.
+    """
     for path in ("/auth/signup", "/auth/register", "/users"):
         assert (await anon_client.post(path, json={})).status_code in (404, 405)
 
@@ -460,3 +464,156 @@ def test_the_rate_limiter_and_the_api_agree_on_the_cookie_name() -> None:
     from legal_lens.middleware import SESSION_COOKIE
 
     assert COOKIE_NAME == SESSION_COOKIE
+
+
+# ---------------------------------------------------------------------------
+# Open sign-in (`LEGAL_LENS_OPEN_SIGNIN`)
+# ---------------------------------------------------------------------------
+# On by default: any email that signs in gets an account, created with the password
+# submitted. What these pin down is the boundary — what it opens, and what it must
+# still refuse.
+
+
+async def test_an_unknown_email_gets_an_account_and_a_session(
+    app: FastAPI, anon_client: AsyncClient
+) -> None:
+    assert app.state.settings.open_signin is True
+
+    response = await anon_client.post(
+        "/auth/signin", json={"email": "newcomer@firm.test", "password": "a-brand-new-password"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user"]["email"] == "newcomer@firm.test"
+    assert "HttpOnly" in response.headers["set-cookie"]
+    # A usable session, not merely a 200.
+    assert (await anon_client.get("/matters")).status_code == 200
+
+
+async def test_the_password_from_the_first_visit_is_the_account_password(
+    anon_client: AsyncClient,
+) -> None:
+    """The second visit is an ordinary sign-in, so a typo on the first is a new
+    account rather than a lockout — and a *different* password later is refused."""
+    await anon_client.post(
+        "/auth/signin", json={"email": "newcomer@firm.test", "password": "a-brand-new-password"}
+    )
+    await anon_client.post("/auth/signout")
+
+    wrong = await anon_client.post(
+        "/auth/signin", json={"email": "newcomer@firm.test", "password": "some-other-password"}
+    )
+    assert wrong.status_code == 401
+    assert wrong.json()["code"] == "invalid_credentials"
+
+    right = await anon_client.post(
+        "/auth/signin", json={"email": "newcomer@firm.test", "password": "a-brand-new-password"}
+    )
+    assert right.status_code == 200
+
+
+async def test_open_sign_in_cannot_walk_into_an_existing_account(
+    app: FastAPI, anon_client: AsyncClient
+) -> None:
+    """The line that matters. Provisioning happens only when there is no account; an
+    address that already has one still needs that account's password."""
+    await app.state.services.auth.create_user(
+        email=TEST_EMAIL, name="Test Attorney", password=TEST_PASSWORD
+    )
+    response = await anon_client.post(
+        "/auth/signin", json={"email": TEST_EMAIL, "password": "not-their-password"}
+    )
+    assert response.status_code == 401
+
+
+async def test_open_sign_in_does_not_revive_a_disabled_account(
+    app: FastAPI, anon_client: AsyncClient
+) -> None:
+    """Disabling must not be undone by signing in again, or it accomplishes nothing."""
+    services = app.state.services
+    user = await services.auth.create_user(email=TEST_EMAIL, name="T", password=TEST_PASSWORD)
+    await services.db.execute("UPDATE users SET is_active = 0 WHERE id = ?", (user.id,))
+
+    response = await anon_client.post(
+        "/auth/signin", json={"email": TEST_EMAIL, "password": TEST_PASSWORD}
+    )
+    assert response.status_code == 401
+    assert await services.users.count() == 1
+
+
+async def test_a_short_password_cannot_create_an_account(anon_client: AsyncClient) -> None:
+    response = await anon_client.post(
+        "/auth/signin", json={"email": "newcomer@firm.test", "password": "short"}
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == "password_too_short"
+
+
+async def test_accounts_made_this_way_are_still_isolated(
+    app: FastAPI, anon_client: AsyncClient
+) -> None:
+    """Self-service accounts are ordinary accounts: separate matters, separate
+    libraries. Open sign-in changes who may get in, not what they can see."""
+    await anon_client.post(
+        "/auth/signin", json={"email": "first@firm.test", "password": "a-long-password-one"}
+    )
+    made = await anon_client.post("/conversations", json={"title": "first user's work"})
+    conversation_id = made.json()["id"]
+
+    await anon_client.post(
+        "/auth/signin", json={"email": "second@firm.test", "password": "a-long-password-two"}
+    )
+    assert (await anon_client.get("/conversations")).json() == []
+    assert (await anon_client.get(f"/conversations/{conversation_id}/messages")).status_code == 404
+
+
+async def test_health_says_whether_sign_in_is_open(anon_client: AsyncClient) -> None:
+    """Answerable without reading the deployment's environment."""
+    checks = (await anon_client.get("/health")).json()["checks"]
+    assert checks["auth"] == "ok (open sign-in: any email gets an account)"
+
+
+# ---------------------------------------------------------------------------
+# Strict mode: the behaviour `open_signin=false` restores
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def strict_client(tmp_path) -> AsyncIterator[tuple[FastAPI, AsyncClient]]:
+    settings = Settings(
+        environment="test", data_dir=tmp_path, llm_provider="echo", open_signin=False
+    )
+    app = create_app(settings)
+    async with (
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://test/api") as client,
+        app.router.lifespan_context(app),
+    ):
+        yield app, client
+
+
+async def test_strict_mode_refuses_an_unknown_address(
+    strict_client: tuple[FastAPI, AsyncClient],
+) -> None:
+    app, client = strict_client
+    await app.state.services.auth.create_user(email=TEST_EMAIL, name="T", password=TEST_PASSWORD)
+
+    unknown = await client.post(
+        "/auth/signin", json={"email": "nobody@firm.test", "password": TEST_PASSWORD}
+    )
+    wrong = await client.post(
+        "/auth/signin", json={"email": TEST_EMAIL, "password": "wrong-password-entirely"}
+    )
+
+    # Indistinguishable, which is the property open sign-in gives up.
+    assert unknown.status_code == wrong.status_code == 401
+    assert unknown.json()["code"] == wrong.json()["code"] == "invalid_credentials"
+    assert unknown.json()["detail"] == wrong.json()["detail"]
+    assert await app.state.services.users.count() == 1
+
+
+async def test_strict_mode_says_so_on_health(
+    strict_client: tuple[FastAPI, AsyncClient],
+) -> None:
+    _, client = strict_client
+    checks = (await client.get("/health")).json()["checks"]
+    assert checks["auth"] == "ok (accounts created by an operator)"

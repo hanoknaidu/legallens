@@ -91,6 +91,14 @@ async def health(services: ServicesDep, settings: SettingsDep) -> HealthResponse
         # The in-memory store is a supported Phase 1 configuration, not a missing
         # dependency, so it reports ok and names itself.
         "vector_store": _vector_store_state(services, settings),
+        # Open sign-in is a supported configuration, so it reports ok — but it names
+        # itself, because "can anyone sign in?" is the sort of thing that should be
+        # answerable without reading the deployment's environment.
+        "auth": (
+            "ok (open sign-in: any email gets an account)"
+            if settings.open_signin
+            else "ok (accounts created by an operator)"
+        ),
     }
     # Only when that pipeline is the one serving questions. Its index is a third
     # place the text lives, and an empty one is the silent failure on this path:

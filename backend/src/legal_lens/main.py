@@ -119,10 +119,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # through a 50MB POST. /health probes it instead.
     settings.objects_path.mkdir(parents=True, exist_ok=True)
 
+    if settings.open_signin:
+        # Loud, every boot, and a warning rather than info. An open document library
+        # is a deliberate configuration, and the failure mode of a deliberate
+        # configuration is that everyone forgets it is set.
+        log.warning(
+            "open sign-in is ON: any email that signs in gets an account",
+            extra={
+                "setting": "LEGAL_LENS_OPEN_SIGNIN",
+                "consequence": "anyone who can reach this service can read and upload documents",
+                "disable_with": "LEGAL_LENS_OPEN_SIGNIN=false",
+            },
+        )
+
     log.info(
         "service started",
         extra={
             "environment": settings.environment,
+            "open_signin": settings.open_signin,
             "db": str(settings.db_path),
             "llm_provider": settings.llm_provider,
             "vector_store": settings.vector_store,

@@ -20,7 +20,62 @@ Email and password, verified against a server-side session.
 | Password hash | scrypt (`hashlib`) | argon2id is the better primitive, but it is a C extension and a new dependency. scrypt is memory-hard, OpenSSL-backed and already in the image, so the shipped artifact stays at the 221MB `backend/DOCKER.md` documents and `uv.lock` is untouched. |
 | Session | Opaque token, row in `sessions` | A JWT stays valid until it expires no matter what the server thinks. Sign-out has to actually end a session for privileged material (§8.2), and the only fix for a JWT is a revocation list — which is this table, minus the benefit. |
 | Transport | `HttpOnly` cookie | A token in `localStorage` is readable by the page's own JavaScript by definition, so any XSS bug anywhere in the app exfiltrates the session. The cost is CSRF exposure, handled below. |
-| Account creation | Operator CLI or first-run bootstrap | A firm's document library is not something a stranger joins. There is no sign-up route, and a test asserts there isn't one. |
+| Account creation | **Open by default** — see [Open sign-in](#open-sign-in) | Configurable. With `LEGAL_LENS_OPEN_SIGNIN=false` accounts come only from the operator CLI or first-run bootstrap. |
+
+## Open sign-in
+
+**`LEGAL_LENS_OPEN_SIGNIN` is on by default.** An email with no account signs in and
+gets one, created with the password submitted. The second visit is an ordinary
+sign-in with that password.
+
+Read the consequence plainly: **anyone who can reach the service can create an
+account and start uploading and reading documents in their own library.** The BRD
+classes what is stored here as privileged attorney-client material (§8.2), so for any
+deployment reachable beyond a laptop this should be `false` and accounts should come
+from the CLI.
+
+The service says so at every boot, at `WARNING`:
+
+```
+open sign-in is ON: any email that signs in gets an account
+```
+
+and `/api/health` reports it, so the answer does not require reading the
+deployment's environment:
+
+```json
+"auth": "ok (open sign-in: any email gets an account)"
+```
+
+### What it does not open
+
+| Still refused | Why it matters |
+|---|---|
+| An existing account with the wrong password | Provisioning happens only when there is no account, so this cannot be used to walk into someone else's library by typing their address. |
+| A disabled account | Otherwise `auth.cli disable` would be undone by signing in again. |
+| A password under 12 characters | The account is not created; the request is a 422. |
+
+Accounts made this way are ordinary accounts — their own matter, their own library,
+the same `owner_id` filtering as any other. Open sign-in changes *who may get in*,
+not *what they can see*.
+
+### What it costs
+
+Enumeration resistance. With it off, an unknown address and a wrong password give
+byte-identical replies, so the endpoint cannot be asked "is this person a client of
+this firm?". With it on, a new address that submits a short password is told the
+password is too short, while a known address is told the credentials are wrong — and
+those two replies are distinguishable.
+
+That is inherent to self-service sign-up, not an implementation detail that could be
+tidied away: a form that provisions accounts necessarily behaves differently for an
+address that has one.
+
+Turn it off with:
+
+```bash
+LEGAL_LENS_OPEN_SIGNIN=false
+```
 
 ## Creating accounts
 
@@ -106,7 +161,9 @@ Stated rather than papered over.
    expiry — a feature, not an omission to fix in passing.
 5. **No MFA, no password history, no rotation policy.** All reasonable asks for a
    firm handling privileged material, and all out of scope here.
-6. **Sign-in events go to the log, not to `audit_log`.** That table's shape is
+6. **Open sign-in is on by default** (above), which trades away enumeration
+   resistance and means the service is self-service unless configured otherwise.
+7. **Sign-in events go to the log, not to `audit_log`.** That table's shape is
    per-generation (FR-20: feature, tokens, cost, grounding). Bending it to hold
    authentication events would make both harder to read.
 
@@ -124,7 +181,9 @@ cleaner and orphans everything already uploaded.
 
 ## Tests
 
-`backend/tests/test_auth.py`, 35 tests. The one that justifies the rest:
+`backend/tests/test_auth.py`, 43 tests, including both sign-in modes — the open-mode
+boundaries above, and a `strict_client` fixture that pins the byte-identical replies
+`open_signin=false` restores. The one that justifies the rest:
 `test_one_user_cannot_see_another_users_documents` drives two real sessions through
 HTTP and asserts a document uploaded by one attorney is absent from the other's
 library *and* unreachable by id — which is the failure that matters if an id ever
