@@ -1,0 +1,462 @@
+"""Authentication (BRD §6.1, Phase 2).
+
+What these tests are for: the BRD's claim that Phase 1's missing login was "a
+deliberate scope cut, not an oversight" rested on the data model carrying `owner_id`
+everywhere so that Phase 2 would be a middleware change. These check that the
+middleware change actually holds the line — most importantly that one user cannot see
+another's documents, which is the whole point of the owner column.
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi import FastAPI
+from httpx import AsyncClient
+
+from conftest import TEST_EMAIL, TEST_PASSWORD
+from fixtures import text_pdf
+from helpers import MSA_PAGES
+from legal_lens.auth.passwords import hash_password, token_hash, verify_password
+from legal_lens.auth.throttle import SignInThrottle
+from legal_lens.config import PHASE1_OWNER_ID
+from legal_lens.db.repositories.users import UserRepository
+from legal_lens.errors import ApiProblem
+
+SECOND_EMAIL = "opposing@counsel.test"
+SECOND_PASSWORD = "a-different-long-password"
+
+
+# ---------------------------------------------------------------------------
+# Passwords
+# ---------------------------------------------------------------------------
+
+
+def test_a_password_verifies_against_its_own_hash() -> None:
+    encoded = hash_password("correct horse battery staple", n=2**12)
+    assert verify_password("correct horse battery staple", encoded)
+    assert not verify_password("Correct horse battery staple", encoded)
+
+
+def test_the_hash_carries_its_own_parameters() -> None:
+    """So raising the cost later does not invalidate hashes written under the old one."""
+    encoded = hash_password("x" * 12, n=2**12)
+    algorithm, n, r, p, _salt, _key = encoded.split("$")
+    assert (algorithm, n, r, p) == ("scrypt", "4096", "8", "1")
+    # The same password hashed twice differs: the salt is per-hash, so a stolen table
+    # cannot be attacked once for every user who chose the same password.
+    assert hash_password("x" * 12, n=2**12) != encoded
+
+
+def test_a_corrupt_hash_fails_rather_than_raising() -> None:
+    """A column holding something unexpected must read as "does not match" — a 500
+    would tell the caller the account exists and its record is broken."""
+    for broken in ("", "not-a-hash", "scrypt$x$8$1$aaaa$bbbb", "argon2$1$2$3$aa$bb"):
+        assert not verify_password("anything", broken)
+
+
+# ---------------------------------------------------------------------------
+# Sign-in
+# ---------------------------------------------------------------------------
+
+
+async def test_signing_in_sets_an_httponly_session_cookie(
+    app: FastAPI, anon_client: AsyncClient
+) -> None:
+    await app.state.services.auth.create_user(
+        email=TEST_EMAIL, name="Test Attorney", password=TEST_PASSWORD
+    )
+    response = await anon_client.post(
+        "/auth/signin", json={"email": TEST_EMAIL, "password": TEST_PASSWORD}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user"]["email"] == TEST_EMAIL
+    cookie = response.headers["set-cookie"]
+    # HttpOnly is the one property that makes an XSS bug anywhere in the app unable to
+    # read the session; SameSite is what stands in for CSRF tokens on a same-origin app.
+    assert "HttpOnly" in cookie
+    assert "SameSite=lax" in cookie.lower().replace("samesite=lax", "SameSite=lax")
+    assert "Path=/api" in cookie
+    # Not Secure in test/dev: a Secure cookie is never sent over plain HTTP, and the
+    # symptom is a sign-in that appears to work and then does nothing.
+    assert "Secure" not in cookie
+
+
+async def test_the_session_cookie_is_secure_in_prod(tmp_path) -> None:
+    from legal_lens.config import Settings
+    from legal_lens.main import create_app
+
+    settings = Settings(environment="prod", data_dir=tmp_path, llm_provider="echo", scrypt_n=2**12)
+    assert settings.cookie_secure is True
+
+    app = create_app(settings)
+    from httpx import ASGITransport
+
+    async with (
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://test/api") as client,
+        app.router.lifespan_context(app),
+    ):
+        await app.state.services.auth.create_user(
+            email=TEST_EMAIL, name="T", password=TEST_PASSWORD
+        )
+        response = await client.post(
+            "/auth/signin", json={"email": TEST_EMAIL, "password": TEST_PASSWORD}
+        )
+        assert "Secure" in response.headers["set-cookie"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"email": TEST_EMAIL, "password": "wrong-password-entirely"},
+        {"email": "nobody@firm.test", "password": TEST_PASSWORD},
+    ],
+    ids=["wrong password", "no such account"],
+)
+async def test_every_sign_in_failure_looks_identical(
+    app: FastAPI, anon_client: AsyncClient, payload: dict[str, str]
+) -> None:
+    """A wrong password and an unknown address must be indistinguishable.
+
+    Otherwise the endpoint answers "is this person a client of this firm?", which for
+    a legal product is itself privileged (BRD §8.2).
+    """
+    await app.state.services.auth.create_user(
+        email=TEST_EMAIL, name="Test Attorney", password=TEST_PASSWORD
+    )
+    response = await anon_client.post("/auth/signin", json=payload)
+
+    assert response.status_code == 401
+    body = response.json()
+    assert body["code"] == "invalid_credentials"
+    assert body["detail"] == "Email or password is incorrect."
+    assert "set-cookie" not in response.headers
+
+
+async def test_a_disabled_account_cannot_sign_in(app: FastAPI, anon_client: AsyncClient) -> None:
+    services = app.state.services
+    user = await services.auth.create_user(
+        email=TEST_EMAIL, name="Test Attorney", password=TEST_PASSWORD
+    )
+    await services.db.execute("UPDATE users SET is_active = 0 WHERE id = ?", (user.id,))
+
+    response = await anon_client.post(
+        "/auth/signin", json={"email": TEST_EMAIL, "password": TEST_PASSWORD}
+    )
+    # Same message as every other failure: that the account exists but is disabled is
+    # not something the sign-in form should disclose.
+    assert response.status_code == 401
+    assert response.json()["code"] == "invalid_credentials"
+
+
+async def test_the_email_is_not_case_sensitive(app: FastAPI, anon_client: AsyncClient) -> None:
+    await app.state.services.auth.create_user(
+        email="Attorney@Firm.Test", name="T", password=TEST_PASSWORD
+    )
+    response = await anon_client.post(
+        "/auth/signin", json={"email": "ATTORNEY@firm.test", "password": TEST_PASSWORD}
+    )
+    assert response.status_code == 200
+
+
+async def test_repeated_failures_lock_the_account_out(
+    app: FastAPI, anon_client: AsyncClient
+) -> None:
+    await app.state.services.auth.create_user(email=TEST_EMAIL, name="T", password=TEST_PASSWORD)
+    wrong = {"email": TEST_EMAIL, "password": "not-the-password"}
+
+    for _ in range(5):
+        assert (await anon_client.post("/auth/signin", json=wrong)).status_code == 401
+
+    locked = await anon_client.post("/auth/signin", json=wrong)
+    assert locked.status_code == 429
+    assert locked.json()["code"] == "too_many_attempts"
+
+    # And the lockout is on the attempt, not on the password: the right one is refused
+    # too, which is what stops an attacker using the lockout as an oracle.
+    right = await anon_client.post(
+        "/auth/signin", json={"email": TEST_EMAIL, "password": TEST_PASSWORD}
+    )
+    assert right.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# Protected routes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", "/matters"),
+        ("get", "/conversations"),
+        ("get", "/documents"),
+        ("get", "/audit"),
+        ("post", "/conversations"),
+    ],
+)
+async def test_a_protected_route_refuses_an_anonymous_caller(
+    anon_client: AsyncClient, method: str, path: str
+) -> None:
+    response = await getattr(anon_client, method)(path)
+    assert response.status_code == 401
+    assert response.json()["code"] == "unauthenticated"
+
+
+async def test_health_stays_open(anon_client: AsyncClient) -> None:
+    """A monitor has no session, and a health check that needs one reports an outage
+    whenever authentication breaks — which is exactly when it must still answer."""
+    assert (await anon_client.get("/health")).status_code == 200
+
+
+async def test_the_session_route_answers_without_a_session(anon_client: AsyncClient) -> None:
+    """The login page asks "is anyone signed in?" on load. 401 there would be
+    indistinguishable from a server fault."""
+    response = await anon_client.get("/auth/session")
+    assert response.status_code == 200
+    assert response.json()["user"] is None
+
+
+async def test_a_signed_in_caller_is_let_through(client: AsyncClient) -> None:
+    assert (await client.get("/matters")).status_code == 200
+    me = await client.get("/auth/me")
+    assert me.status_code == 200
+    assert me.json()["email"] == TEST_EMAIL
+
+
+# ---------------------------------------------------------------------------
+# Sign-out and session lifetime
+# ---------------------------------------------------------------------------
+
+
+async def test_signing_out_ends_the_session_server_side(app: FastAPI, client: AsyncClient) -> None:
+    """The reason sessions are a table and not a JWT: this has to actually revoke."""
+    token = client.cookies.get("ll_session")
+    assert token is not None
+    users = UserRepository(app.state.services.db)
+    assert await users.session_user(token_hash(token)) is not None
+
+    assert (await client.post("/auth/signout")).status_code == 204
+
+    # Gone from the database, not merely forgotten by the browser — so a copy of the
+    # cookie taken before sign-out is worthless.
+    assert await users.session_user(token_hash(token)) is None
+    client.cookies.set("ll_session", token, domain="test", path="/api")
+    assert (await client.get("/matters")).status_code == 401
+
+
+async def test_signing_out_without_a_session_is_not_an_error(anon_client: AsyncClient) -> None:
+    assert (await anon_client.post("/auth/signout")).status_code == 204
+
+
+async def test_an_expired_session_is_refused(app: FastAPI, client: AsyncClient) -> None:
+    token = client.cookies.get("ll_session")
+    assert token is not None
+    # Reach past the TTL rather than waiting eight hours for it.
+    await app.state.services.db.execute(
+        "UPDATE sessions SET expires_at = '2020-01-01T00:00:00.000000Z' WHERE token_hash = ?",
+        (token_hash(token),),
+    )
+    assert (await client.get("/matters")).status_code == 401
+
+
+async def test_using_a_session_slides_its_expiry(app: FastAPI, client: AsyncClient) -> None:
+    """An idle timeout, not a hard cap: an attorney working through a long document
+    should not be signed out mid-draft."""
+    db = app.state.services.db
+    digest = token_hash(client.cookies.get("ll_session"))
+    before = (
+        await db.fetch_one("SELECT expires_at FROM sessions WHERE token_hash = ?", (digest,))
+    )["expires_at"]
+
+    await db.execute(
+        "UPDATE sessions SET expires_at = '2030-01-01T00:00:00.000000Z' WHERE token_hash = ?",
+        (digest,),
+    )
+    await client.get("/matters")
+
+    after = (await db.fetch_one("SELECT expires_at FROM sessions WHERE token_hash = ?", (digest,)))[
+        "expires_at"
+    ]
+    # Reset to now+TTL, so the hand-planted far-future value is gone.
+    assert after != "2030-01-01T00:00:00.000000Z"
+    assert after != before
+
+
+async def test_a_forged_cookie_is_refused(anon_client: AsyncClient) -> None:
+    anon_client.cookies.set("ll_session", "a" * 43, domain="test", path="/api")
+    assert (await anon_client.get("/matters")).status_code == 401
+
+
+async def test_signing_in_again_mints_a_new_token(app: FastAPI, client: AsyncClient) -> None:
+    """Never extend or reuse the caller's cookie: an attacker who can plant one and
+    wait for the victim to authenticate it owns the session (session fixation)."""
+    first = client.cookies.get("ll_session")
+    response = await client.post(
+        "/auth/signin", json={"email": TEST_EMAIL, "password": TEST_PASSWORD}
+    )
+    assert response.status_code == 200
+    assert client.cookies.get("ll_session") != first
+
+
+async def test_changing_a_password_ends_every_session(app: FastAPI, client: AsyncClient) -> None:
+    services = app.state.services
+    user = await services.users.by_email(TEST_EMAIL)
+    assert user is not None
+
+    await services.auth.set_password(user, "an-entirely-new-long-password")
+
+    assert (await client.get("/matters")).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# The point of the owner column: isolation
+# ---------------------------------------------------------------------------
+
+
+async def test_the_first_account_adopts_the_phase_one_owner_id(
+    app: FastAPI, anon_client: AsyncClient
+) -> None:
+    """So documents uploaded before there were accounts are not orphaned."""
+    user = await app.state.services.auth.create_user(
+        email=TEST_EMAIL, name="T", password=TEST_PASSWORD
+    )
+    assert user.id == PHASE1_OWNER_ID
+
+
+async def test_a_second_account_gets_its_own_id_and_matter(
+    app: FastAPI, anon_client: AsyncClient
+) -> None:
+    services = app.state.services
+    first = await services.auth.create_user(email=TEST_EMAIL, name="A", password=TEST_PASSWORD)
+    second = await services.auth.create_user(email=SECOND_EMAIL, name="B", password=SECOND_PASSWORD)
+    assert second.id != first.id
+
+    # `m-001` is taken by the first owner, so the second gets a generated id rather
+    # than a UNIQUE violation.
+    first_matter = await services.bootstrap_owner(first.id)
+    second_matter = await services.bootstrap_owner(second.id)
+    assert first_matter != second_matter
+
+
+async def test_one_user_cannot_see_another_users_documents(
+    app: FastAPI, anon_client: AsyncClient
+) -> None:
+    """The test the BRD's §6.1 scope cut was betting on.
+
+    Every repository method takes `owner_id` and every statement filters on it. This
+    drives that through the real HTTP boundary with two real sessions: a document
+    uploaded by one attorney must not appear in the other's library, and must not be
+    fetchable even by id.
+    """
+    services = app.state.services
+    await services.auth.create_user(email=TEST_EMAIL, name="A", password=TEST_PASSWORD)
+    await services.auth.create_user(email=SECOND_EMAIL, name="B", password=SECOND_PASSWORD)
+
+    # Attorney A uploads.
+    await anon_client.post("/auth/signin", json={"email": TEST_EMAIL, "password": TEST_PASSWORD})
+    created = await anon_client.post(
+        "/documents", files={"file": ("msa.pdf", text_pdf(MSA_PAGES), "application/pdf")}
+    )
+    assert created.status_code in (200, 201), created.text
+    document_id = created.json()["id"]
+    assert len((await anon_client.get("/documents")).json()) == 1
+
+    # Attorney B signs in on the same client, replacing the cookie.
+    await anon_client.post(
+        "/auth/signin", json={"email": SECOND_EMAIL, "password": SECOND_PASSWORD}
+    )
+    assert (await anon_client.get("/documents")).json() == []
+
+    # Not merely hidden from the list — unreachable by id, which is the failure that
+    # matters if an id ever leaks.
+    assert (await anon_client.get(f"/documents/{document_id}")).status_code == 404
+    assert (await anon_client.get(f"/documents/{document_id}/status")).status_code == 404
+
+
+async def test_conversations_are_not_shared_between_users(
+    app: FastAPI, anon_client: AsyncClient
+) -> None:
+    services = app.state.services
+    await services.auth.create_user(email=TEST_EMAIL, name="A", password=TEST_PASSWORD)
+    await services.auth.create_user(email=SECOND_EMAIL, name="B", password=SECOND_PASSWORD)
+
+    await anon_client.post("/auth/signin", json={"email": TEST_EMAIL, "password": TEST_PASSWORD})
+    made = await anon_client.post("/conversations", json={"title": "A's matter"})
+    assert made.status_code in (200, 201), made.text
+    conversation_id = made.json()["id"]
+
+    await anon_client.post(
+        "/auth/signin", json={"email": SECOND_EMAIL, "password": SECOND_PASSWORD}
+    )
+    assert (await anon_client.get("/conversations")).json() == []
+
+    # There is no GET for a single conversation, so the reachable-by-id check goes
+    # through the routes that do exist: reading its messages, renaming it, deleting it.
+    # All three must 404 rather than touch another owner's row.
+    assert (await anon_client.get(f"/conversations/{conversation_id}/messages")).status_code == 404
+    assert (
+        await anon_client.patch(f"/conversations/{conversation_id}", json={"title": "mine now"})
+    ).status_code == 404
+    assert (await anon_client.delete(f"/conversations/{conversation_id}")).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Account creation rules
+# ---------------------------------------------------------------------------
+
+
+async def test_a_duplicate_email_is_refused(app: FastAPI, anon_client: AsyncClient) -> None:
+    services = app.state.services
+    await services.auth.create_user(email=TEST_EMAIL, name="A", password=TEST_PASSWORD)
+    with pytest.raises(ApiProblem) as caught:
+        await services.auth.create_user(email=TEST_EMAIL, name="B", password=SECOND_PASSWORD)
+    assert caught.value.code == "email_taken"
+
+
+async def test_a_short_password_is_refused(app: FastAPI, anon_client: AsyncClient) -> None:
+    with pytest.raises(ApiProblem) as caught:
+        await app.state.services.auth.create_user(email=TEST_EMAIL, name="A", password="short")
+    assert caught.value.code == "password_too_short"
+
+
+async def test_there_is_no_public_sign_up_route(anon_client: AsyncClient) -> None:
+    """Accounts are created by an operator (`auth.cli`) or by first-run bootstrap. A
+    firm's document library is not something a stranger joins."""
+    for path in ("/auth/signup", "/auth/register", "/users"):
+        assert (await anon_client.post(path, json={})).status_code in (404, 405)
+
+
+# ---------------------------------------------------------------------------
+# Throttle unit behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_the_throttle_forgets_failures_after_a_success() -> None:
+    throttle = SignInThrottle(max_attempts=3, window_seconds=600, lockout_seconds=300)
+    key = "a@b|1.2.3.4"
+    throttle.record_failure(key)
+    throttle.record_failure(key)
+    throttle.record_success(key)
+    # Someone who eventually remembers their password is not left one typo from a
+    # lockout.
+    throttle.record_failure(key)
+    throttle.record_failure(key)
+    assert throttle.check(key) == 0
+
+
+def test_the_lockout_lapses() -> None:
+    throttle = SignInThrottle(max_attempts=2, window_seconds=600, lockout_seconds=60)
+    key = "a@b|1.2.3.4"
+    throttle.record_failure(key, now=1000.0)
+    throttle.record_failure(key, now=1001.0)
+    assert throttle.check(key, now=1002.0) > 0
+    assert throttle.check(key, now=1062.0) == 0
+
+
+def test_the_rate_limiter_and_the_api_agree_on_the_cookie_name() -> None:
+    """Two modules name the cookie; a rename that touches one is a silent bug."""
+    from legal_lens.api.auth import COOKIE_NAME
+    from legal_lens.middleware import SESSION_COOKIE
+
+    assert COOKIE_NAME == SESSION_COOKIE

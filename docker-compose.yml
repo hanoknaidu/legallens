@@ -4,6 +4,10 @@
 #   docker compose up --build
 #   open http://localhost:8080
 #
+# Sign in with LEGAL_LENS_BOOTSTRAP_EMAIL / LEGAL_LENS_BOOTSTRAP_PASSWORD below —
+# attorney@firm.test / change-this-password unless you override them. Change them
+# before the first boot: the account is created once, on a database with no users.
+#
 # The browser talks only to the frontend. nginx inside it proxies /api to the
 # backend over this file's private network, which is why the app is same-origin
 # and CORS never comes up — the same arrangement the Vite proxy makes in dev.
@@ -38,6 +42,14 @@ services:
       # The image defaults to prod, which disables /api/docs and
       # /api/openapi.json. This is a local stack, so the docs are worth having.
       LEGAL_LENS_ENVIRONMENT: "${LEGAL_LENS_ENVIRONMENT:-dev}"
+      # The app has required a sign-in since Phase 2 (docs/auth.md), and a container
+      # has no shell to run `auth.cli` in — so the first account is created at startup
+      # from these. Only when the users table is empty: restarting with them set
+      # cannot reset an existing password. Override before first boot, or create
+      # further accounts with
+      #   docker compose exec backend python -m legal_lens.auth.cli create you@firm.com
+      LEGAL_LENS_BOOTSTRAP_EMAIL: "${LEGAL_LENS_BOOTSTRAP_EMAIL:-attorney@firm.test}"
+      LEGAL_LENS_BOOTSTRAP_PASSWORD: "${LEGAL_LENS_BOOTSTRAP_PASSWORD:-change-this-password}"
     volumes:
       # The SQLite database, every uploaded original and the live vector index.
       # Without this, a `docker compose down` loses every document.

@@ -4,14 +4,29 @@
 never been enforced, which is worse than not having it — the setting reads as a
 control that exists.
 
-In-process and per-owner, which is sound only because the service is single-worker by
+In-process and per-caller, which is sound only because the service is single-worker by
 design (the pending-turn registry lives in memory and SQLite takes one writer). A
 second worker would give each its own allowance; that is a Redis change, and it
 arrives with the same change that makes multi-worker possible at all.
+
+**What "per-caller" means, and why it is not per-user.** Middleware runs before
+dependencies, so resolving the cookie to a user id here would mean a database read on
+every request, duplicating the one `deps.current_user` already does. The key is
+therefore derived from the session *token* without touching the database, and an
+unauthenticated request is keyed on its source address. Two consequences worth stating:
+
+* A user with two browsers gets two allowances. For a limit that exists to stop one
+  client hammering the service, that is an acceptable loosening — and the alternative
+  costs a query per request forever.
+* Sign-in is keyed by address, because there is no session yet. So a sign-in cannot
+  consume the allowance of the session it is about to create, and a flood of sign-in
+  attempts from one address is still bounded here — on top of
+  `auth.throttle.SignInThrottle`, which bounds password guessing per account.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections import deque
@@ -19,7 +34,7 @@ from collections import deque
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from .config import PHASE1_OWNER_ID, Settings
+from .config import Settings
 from .errors import CONTENT_TYPE
 from .observability import METRICS, request_id_var
 
@@ -32,6 +47,11 @@ EXEMPT_PATHS = frozenset({"/api/health", "/api/metrics"})
 #: Streaming a long answer holds one request open for minutes. Counting it against a
 #: per-minute allowance would make a slow answer look like abuse.
 EXEMPT_PREFIXES = ("/api/chat/stream",)
+
+#: Duplicated from `api.auth` rather than imported, because importing a router module
+#: here would make the middleware depend on the API layer it wraps. The two are pinned
+#: together by a test.
+SESSION_COOKIE = "ll_session"
 
 
 class RateLimiter:
@@ -70,6 +90,20 @@ class RateLimiter:
         return max(0, self._limit - len(self._hits.get(owner_id, ())))
 
 
+def _caller_key(request: Request) -> str:
+    """Who to count this request against.
+
+    The session cookie is hashed rather than used raw so the key cannot leak a live
+    token into a log line or a metric label. Truncated because this is a bucket key,
+    not a credential check — a collision would merely share an allowance.
+    """
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        return "session:" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    client = request.client
+    return f"ip:{client.host}" if client else "ip:unknown"
+
+
 def register_rate_limit(app, settings: Settings) -> None:
     limiter = RateLimiter(settings.rate_limit_per_minute)
     app.state.rate_limiter = limiter
@@ -80,11 +114,8 @@ def register_rate_limit(app, settings: Settings) -> None:
         if path in EXEMPT_PATHS or path.startswith(EXEMPT_PREFIXES):
             return await call_next(request)
 
-        # Phase 1 has no login, so there is one owner and the limit is effectively
-        # global. It is keyed by owner anyway, so Phase 2 authentication makes this
-        # per-user without touching this file.
-        owner_id = PHASE1_OWNER_ID
-        allowed, retry_after = limiter.check(owner_id)
+        caller = _caller_key(request)
+        allowed, retry_after = limiter.check(caller)
         if not allowed:
             METRICS.incr("rate_limited", route=path)
             log.warning("rate limited", extra={"path": path, "retry_after": retry_after})
@@ -113,5 +144,5 @@ def register_rate_limit(app, settings: Settings) -> None:
 
         response = await call_next(request)
         response.headers["X-RateLimit-Limit"] = str(settings.rate_limit_per_minute)
-        response.headers["X-RateLimit-Remaining"] = str(limiter.remaining(owner_id))
+        response.headers["X-RateLimit-Remaining"] = str(limiter.remaining(caller))
         return response

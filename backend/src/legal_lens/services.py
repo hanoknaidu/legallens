@@ -17,6 +17,7 @@ from .ai.pricing import cost_usd
 from .ai.probe import UNCHECKED, ProbeResult, probe
 from .ai.router import detect_intent
 from .ai.types import GenerationProvider
+from .auth.service import AuthService
 from .chat.registry import PendingRegistry
 from .config import Settings
 from .db.repositories import (
@@ -25,6 +26,7 @@ from .db.repositories import (
     DocumentRepository,
     MatterRepository,
     MessageRepository,
+    UserRepository,
 )
 from .db.session import Database
 from .ingestion import IngestionPipeline
@@ -51,6 +53,12 @@ class Services:
         self.messages = MessageRepository(db)
         self.documents = DocumentRepository(db)
         self.audit = AuditRepository(db)
+        self.users = UserRepository(db)
+        self.auth = AuthService(
+            self.users,
+            session_ttl_seconds=settings.session_ttl_seconds,
+            scrypt_n=settings.password_scrypt_n,
+        )
 
         # Retrieval. `embedder_for` raises on an unimplemented provider rather than
         # falling back, so a misconfiguration fails at startup, not mid-answer.
@@ -235,6 +243,16 @@ class Services:
             )
             self._intent_classifier_instance = None
         return self._intent_classifier_instance
+
+    async def bootstrap_owner(self, owner_id: str) -> str:
+        """Seed what a newly signed-in owner needs in order to use the app (FR-4).
+
+        Called on every sign-in rather than only the first: it is one query and
+        idempotent, and the alternative is remembering which users have been seeded. A
+        second user gets their own matter here — `ensure_default` generates an id when
+        `m-001` is already taken.
+        """
+        return await self.matters.ensure_default(owner_id)
 
     async def bootstrap(self, owner_id: str) -> None:
         """First-boot seeding (FR-4). Idempotent, so it runs on every start."""

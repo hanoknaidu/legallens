@@ -29,6 +29,10 @@ export default defineConfig({
 
   use: {
     baseURL: process.env.E2E_BASE_URL ?? "http://localhost:5173",
+    // The session acquired once in global-setup. Every spec starts signed in; the
+    // sign-in and sign-out flows themselves are tested in 10-auth.spec.ts, which
+    // opts out of this with `test.use({ storageState: { cookies: [], origins: [] } })`.
+    storageState: ".auth/state.json",
     // Wide enough that the sidebar is pinned (>=1024px) and the document panel docks
     // beside the thread (>=1440px) rather than taking over as an overlay.
     viewport: { width: 1600, height: 1000 },

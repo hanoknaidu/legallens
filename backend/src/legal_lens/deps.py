@@ -1,8 +1,17 @@
 """Request dependencies.
 
-`current_owner_id` is the Phase 2 seam. Phase 1 has no login, so it returns the
-stand-in subject — but it is a dependency rather than a constant inlined in queries,
-which is what lets authentication become a change to this one function (BRD §6.1).
+`current_owner_id` was the Phase 2 seam the BRD promised (§6.1): "authentication
+becomes a middleware and frontend change rather than a schema migration". This is that
+change. It used to return a constant; it now resolves the session cookie to a user id
+and raises 401 when there is none. Every router that already took `OwnerDep` became
+authenticated without being edited, and every query was already filtering on the value
+it returns.
+
+The two dependencies differ in what they hand back, not in what they enforce — both
+require a live session:
+
+* `OwnerDep` — the id, which is what repositories filter on. Used by every data route.
+* `CurrentUserDep` — the whole user, for the routes that show an email or a name.
 """
 
 from __future__ import annotations
@@ -11,7 +20,9 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 
-from .config import PHASE1_OWNER_ID, Settings
+from .auth.service import unauthenticated
+from .config import Settings
+from .db.repositories.users import User
 from .services import Services
 
 
@@ -23,10 +34,34 @@ def get_services(request: Request) -> Services:
     return request.app.state.services
 
 
-def current_owner_id() -> str:
-    return PHASE1_OWNER_ID
+def session_token(request: Request) -> str | None:
+    """The raw cookie value, or None.
+
+    Imported by `api/auth.py` as well, so the cookie name has one definition. It lives
+    here rather than there to avoid a circular import: `api.auth` imports from `deps`.
+    """
+    return request.cookies.get("ll_session")
+
+
+async def current_user(request: Request) -> User:
+    """The signed-in user, or 401.
+
+    Resolving touches the session row, which slides the idle window — so a user who
+    keeps working keeps their session, and one who stops loses it after
+    `session_ttl_seconds`.
+    """
+    services: Services = request.app.state.services
+    user = await services.auth.resolve(session_token(request))
+    if user is None:
+        raise unauthenticated()
+    return user
+
+
+async def current_owner_id(user: Annotated[User, Depends(current_user)]) -> str:
+    return user.id
 
 
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
 ServicesDep = Annotated[Services, Depends(get_services)]
 OwnerDep = Annotated[str, Depends(current_owner_id)]
+CurrentUserDep = Annotated[User, Depends(current_user)]

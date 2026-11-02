@@ -1,7 +1,14 @@
+import path from "node:path";
 import { request } from "@playwright/test";
 
 const API = process.env.E2E_API_URL ?? "http://127.0.0.1:8000";
 const UI = process.env.E2E_BASE_URL ?? "http://localhost:5173";
+
+/** Where the signed-in cookie jar is written. `use.storageState` reads it. */
+export const STORAGE_STATE = path.resolve(__dirname, ".auth/state.json");
+
+const EMAIL = process.env.E2E_EMAIL ?? "attorney@firm.test";
+const PASSWORD = process.env.E2E_PASSWORD ?? "";
 
 /**
  * Refuses to run against a half-started stack.
@@ -50,10 +57,47 @@ export default async function globalSetup() {
     );
   }
 
+  // ---------------------------------------------------------------------
+  // Sign in once, and hand every spec the cookie.
+  //
+  // The app has required a session since Phase 2 (docs/auth.md), so without this
+  // every spec would open the login page and fail on a missing composer — 73
+  // identical, unhelpful failures. Signing in through the real API rather than
+  // through the form keeps that one flow under test in `10-auth.spec.ts` instead of
+  // repeated 73 times as setup.
+  // ---------------------------------------------------------------------
+  if (!PASSWORD) {
+    throw new Error(
+      "E2E_PASSWORD is not set, and the app needs a session.\n\n" +
+        "  export E2E_EMAIL=attorney@firm.test\n" +
+        "  export E2E_PASSWORD=...\n\n" +
+        "Create the account first if it does not exist:\n" +
+        "  cd backend && uv run python -m legal_lens.auth.cli create attorney@firm.test\n",
+    );
+  }
+
+  const signIn = await ctx.post(`${API}/api/auth/signin`, {
+    data: { email: EMAIL, password: PASSWORD },
+    timeout: 15_000,
+  });
+  if (!signIn.ok()) {
+    const body = await signIn.text().catch(() => "");
+    throw new Error(
+      `Sign-in failed for ${EMAIL} (${signIn.status()}). ${body}\n\n` +
+        "Check the password, or reset it:\n" +
+        `  cd backend && uv run python -m legal_lens.auth.cli passwd ${EMAIL}\n`,
+    );
+  }
+
+  // The cookie is scoped to /api and HttpOnly, so it cannot be set from page script —
+  // saving the context's own state is what carries it into the browser.
+  await ctx.storageState({ path: STORAGE_STATE });
+
   // eslint-disable-next-line no-console
   console.log(
     `\n  backend ${API} · status=${health.status} · llm=${llm}` +
-      `\n  orchestrator=${checks.orchestrator ?? "n/a"}\n`,
+      `\n  orchestrator=${checks.orchestrator ?? "n/a"}` +
+      `\n  signed in as ${EMAIL}\n`,
   );
 
   await ctx.dispose();

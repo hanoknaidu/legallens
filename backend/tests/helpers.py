@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 
+from fastapi import FastAPI
 from httpx import AsyncClient
 
 from fixtures import text_pdf
@@ -88,3 +89,27 @@ async def finished_turn(client: AsyncClient, question: str) -> str:
     # Draining the stream is what persists the turn.
     await client.get(f"/chat/stream?messageId={sent['assistantMessageId']}")
     return sent["assistantMessageId"]
+
+
+async def sign_in(
+    app: FastAPI,
+    client: AsyncClient,
+    *,
+    email: str = "attorney@firm.test",
+    password: str = "correct-horse-battery-staple",
+) -> None:
+    """Create an account on this app and sign `client` in through the real route.
+
+    For the tests that build their own app rather than taking the `client` fixture.
+    Every route except `/health` and `/auth/*` needs a session now, so a test that
+    constructs its own client has to acquire one — and acquiring it the way a browser
+    does is what keeps these tests honest about the contract.
+
+    Must be called inside the app's lifespan: `app.state.services` does not exist
+    before it. Idempotent on the account, so a test may call it twice.
+    """
+    services = app.state.services
+    if await services.users.by_email(email) is None:
+        await services.auth.create_user(email=email, name="Test Attorney", password=password)
+    response = await client.post("/auth/signin", json={"email": email, "password": password})
+    assert response.status_code == 200, response.text

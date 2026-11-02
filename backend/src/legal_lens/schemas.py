@@ -335,3 +335,40 @@ class HealthResponse(Wire):
     version: str
     environment: str
     checks: dict[str, str]
+
+
+# ---------------------------------------------------------------------------
+# Identity (BRD §6.1, Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class SignInRequest(Wire):
+    email: str
+    #: No max length and no composition rule. `AuthService.create_user` enforces a
+    #: 12-character minimum at creation; rejecting a *sign-in* for shape would lock
+    #: out anyone whose password predates the rule.
+    password: str
+
+
+class SessionUser(Wire):
+    """The signed-in user, as the frontend sees one.
+
+    Deliberately four fields. The password hash is not on this model and cannot be
+    added to it by accident, because the type the repository returns is a different
+    type (`db.repositories.users.User`) that never crosses the wire.
+    """
+
+    id: str
+    email: str
+    name: str
+    #: What the browser should show before it has to ask again. The cookie carries the
+    #: real expiry; this is for the UI, so a session about to lapse can say so.
+    expires_at: datetime
+
+
+class SessionResponse(Wire):
+    """`GET /auth/session`. `user` is null when nobody is signed in — a 200, not a 401,
+    because "is anyone signed in?" is a question the login page asks on load and the
+    answer "no" is not an error."""
+
+    user: SessionUser | None = None

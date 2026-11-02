@@ -13,7 +13,7 @@ import pytest
 from httpx import AsyncClient
 
 from fixtures import scanned_pdf, text_pdf
-from helpers import await_status
+from helpers import await_status, sign_in
 from legal_lens.config import Settings
 from legal_lens.ingestion.ocr import (
     ILLEGIBLE,
@@ -109,6 +109,7 @@ async def test_a_scan_is_transcribed_and_indexed(ocr_settings: Settings) -> None
     app, client = await _client_with_ocr(ocr_settings, engine)
 
     async with client, app.router.lifespan_context(app):
+        await sign_in(app, client)
         app.state.services.ingestion._ocr = engine
         created = (
             await client.post(
@@ -137,6 +138,7 @@ async def test_transcribed_text_is_chunked_and_indexed_like_any_other(
     app, client = await _client_with_ocr(ocr_settings, engine)
 
     async with client, app.router.lifespan_context(app):
+        await sign_in(app, client)
         app.state.services.ingestion._ocr = engine
         created = (
             await client.post(
@@ -155,6 +157,7 @@ async def test_a_native_pdf_never_reaches_ocr(ocr_settings: Settings) -> None:
     app, client = await _client_with_ocr(ocr_settings, engine)
 
     async with client, app.router.lifespan_context(app):
+        await sign_in(app, client)
         app.state.services.ingestion._ocr = engine
         created = (
             await client.post(
@@ -181,6 +184,7 @@ async def test_a_mostly_illegible_scan_is_rejected(ocr_settings: Settings) -> No
     app, client = await _client_with_ocr(ocr_settings, engine)
 
     async with client, app.router.lifespan_context(app):
+        await sign_in(app, client)
         app.state.services.ingestion._ocr = engine
         created = (
             await client.post(
@@ -200,6 +204,7 @@ async def test_a_scan_with_no_recoverable_text_is_rejected(ocr_settings: Setting
     app, client = await _client_with_ocr(ocr_settings, engine)
 
     async with client, app.router.lifespan_context(app):
+        await sign_in(app, client)
         app.state.services.ingestion._ocr = engine
         created = (
             await client.post(
@@ -225,6 +230,7 @@ async def test_an_oversized_scan_is_refused_before_any_call(tmp_path) -> None:
     app, client = await _client_with_ocr(settings, engine)
 
     async with client, app.router.lifespan_context(app):
+        await sign_in(app, client)
         app.state.services.ingestion._ocr = engine
         created = (
             await client.post(
@@ -244,6 +250,7 @@ async def test_health_names_the_engine_when_ocr_is_on(ocr_settings: Settings) ->
     app, client = await _client_with_ocr(ocr_settings, engine)
 
     async with client, app.router.lifespan_context(app):
+        await sign_in(app, client)
         app.state.services.ocr = engine
         checks = (await client.get("/health")).json()["checks"]
         assert checks["ocr"] == "ok (fake)"
@@ -356,6 +363,7 @@ async def test_ocr_enabled_without_a_key_degrades_instead_of_crashing(tmp_path) 
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test/api") as client,
         app.router.lifespan_context(app),
     ):
+        await sign_in(app, client)
         health = (await client.get("/health")).json()
 
         # It boots.
@@ -508,6 +516,7 @@ async def test_a_fully_described_scan_is_rejected(ocr_settings: Settings) -> Non
     app, client = await _client_with_ocr(ocr_settings, engine)
     async with client:
         async with app.router.lifespan_context(app):
+            await sign_in(app, client)
             app.state.services.ingestion._ocr = engine
             created = (
                 await client.post(
@@ -533,6 +542,7 @@ async def test_a_partly_described_scan_keeps_only_what_was_read(
     app, client = await _client_with_ocr(ocr_settings, engine)
     async with client:
         async with app.router.lifespan_context(app):
+            await sign_in(app, client)
             app.state.services.ingestion._ocr = engine
             created = (
                 await client.post(
@@ -561,6 +571,7 @@ async def test_transcription_is_costed(ocr_settings: Settings) -> None:
     app, client = await _client_with_ocr(ocr_settings, engine)
     async with client:
         async with app.router.lifespan_context(app):
+            await sign_in(app, client)
             services = app.state.services
             services.ingestion._ocr = engine
             created = (
@@ -590,6 +601,7 @@ async def test_a_rejected_scan_is_still_costed(ocr_settings: Settings) -> None:
     app, client = await _client_with_ocr(ocr_settings, engine)
     async with client:
         async with app.router.lifespan_context(app):
+            await sign_in(app, client)
             services = app.state.services
             services.ingestion._ocr = engine
             created = (
@@ -612,6 +624,7 @@ async def test_an_engine_that_bills_nothing_writes_no_row(ocr_settings: Settings
     app, client = await _client_with_ocr(ocr_settings, engine)
     async with client:
         async with app.router.lifespan_context(app):
+            await sign_in(app, client)
             services = app.state.services
             services.ingestion._ocr = engine
             created = (
