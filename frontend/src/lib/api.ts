@@ -19,6 +19,10 @@ import type {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
+    // Kept although the UI has no sign-in: the API can still be run with
+    // `LEGAL_LENS_REQUIRE_AUTH=true` (docs/auth.md), and without this the cookie a
+    // session would need is never sent. Costs nothing when nothing is enforcing.
+    credentials: "include",
     ...init,
   });
   if (!res.ok) throw await ApiError.fromResponse(res, `${init?.method ?? "GET"} ${path}`);
@@ -95,6 +99,9 @@ export async function exportMessage(
   const res = await fetch(`${API_BASE}/messages/${messageId}/export`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    // Same reason as `request()`: this one does not go through it, so it carries the
+    // session itself or downloads a 401.
+    credentials: "include",
     body: JSON.stringify({ format }),
   });
   if (!res.ok) throw await ApiError.fromResponse(res, `POST /messages/${messageId}/export`);

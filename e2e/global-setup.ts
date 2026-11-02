@@ -50,6 +50,19 @@ export default async function globalSetup() {
     );
   }
 
+  // ---------------------------------------------------------------------
+  // Sign in once, and hand every spec the cookie.
+  //
+  // The app has required a session since Phase 2 (docs/auth.md), so without this
+  // every spec would open the login page and fail on a missing composer — 73
+  // identical, unhelpful failures. Signing in through the real API rather than
+  // through the form keeps that one flow under test in `10-auth.spec.ts` instead of
+  // repeated 73 times as setup.
+  // ---------------------------------------------------------------------
+  // No sign-in step: the app has no login page, and the API is not enforcing
+  // sessions (docs/auth.md). If it is ever run with `LEGAL_LENS_REQUIRE_AUTH=true`
+  // these specs will fail on 401s, which is the honest signal — there would be no UI
+  // to acquire a session through.
   // eslint-disable-next-line no-console
   console.log(
     `\n  backend ${API} · status=${health.status} · llm=${llm}` +

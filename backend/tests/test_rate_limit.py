@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from helpers import sign_in
 from legal_lens.config import Settings
 from legal_lens.main import create_app
 from legal_lens.middleware import RateLimiter
@@ -88,6 +89,7 @@ async def test_exceeding_the_limit_returns_problem_json_with_retry_after(
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test/api") as client,
         app.router.lifespan_context(app),
     ):
+        await sign_in(app, client)
         for _ in range(3):
             assert (await client.get("/matters")).status_code == 200
 
@@ -109,6 +111,7 @@ async def test_the_limit_is_advertised_on_every_response(tight_settings: Setting
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test/api") as client,
         app.router.lifespan_context(app),
     ):
+        await sign_in(app, client)
         first = await client.get("/matters")
         assert first.headers["X-RateLimit-Limit"] == "3"
         # So a client can back off before being refused rather than after.
@@ -121,6 +124,7 @@ async def test_health_and_metrics_are_never_limited(tight_settings: Settings) ->
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test/api") as client,
         app.router.lifespan_context(app),
     ):
+        await sign_in(app, client)
         # A monitor that gets 429'd reports an outage that is not happening, and
         # /health is the one endpoint that must answer when the service is struggling.
         for _ in range(10):
@@ -140,6 +144,7 @@ async def test_the_answer_stream_is_not_limited(tight_settings: Settings) -> Non
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test/api") as client,
         app.router.lifespan_context(app),
     ):
+        await sign_in(app, client)
         # Spend the whole allowance first.
         for _ in range(3):
             await client.get("/matters")
@@ -160,6 +165,7 @@ async def test_the_default_limit_does_not_interfere_with_normal_use(tmp_path) ->
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test/api") as client,
         app.router.lifespan_context(app),
     ):
+        await sign_in(app, client)
         # A user clicking around sends nothing like 60 requests a minute; the suite
         # itself would fail noisily if the default were too tight.
         for _ in range(20):

@@ -9,7 +9,9 @@ drift.
 from __future__ import annotations
 
 import asyncio
+import os
 
+from fastapi import FastAPI
 from httpx import AsyncClient
 
 from fixtures import text_pdf
@@ -28,7 +30,18 @@ MSA_PAGES = [
 #: `title` is required on create, so there is no empty create body.
 NEW_CONVERSATION = {"title": "New conversation"}
 
-TERMINAL_TIMEOUT_S = 10.0
+#: How long a document may take to reach a terminal state before the test calls it
+#: a failure. 10s is generous on a developer machine, where the whole suite runs
+#: in about 20s, and the point of a tight budget is that a pipeline which leaves a
+#: row mid-flight is a real defect rather than a slow test.
+#:
+#: A shared CI runner is a different machine: on GitHub's two-core runners the
+#: py3.12 job reproducibly blew the 10s budget on
+#: `test_posting_a_message_persists_the_user_turn_and_returns_a_stream_id` while
+#: py3.14 passed, with the document still mid-flight rather than `failed` — the
+#: pipeline was working, just not that fast. Rather than slacken the budget for
+#: everyone, CI raises it via this variable and keeps the strict default local.
+TERMINAL_TIMEOUT_S = float(os.environ.get("LEGAL_LENS_TEST_TERMINAL_TIMEOUT_S", "10.0"))
 POLL_INTERVAL_S = 0.05
 
 
@@ -76,3 +89,27 @@ async def finished_turn(client: AsyncClient, question: str) -> str:
     # Draining the stream is what persists the turn.
     await client.get(f"/chat/stream?messageId={sent['assistantMessageId']}")
     return sent["assistantMessageId"]
+
+
+async def sign_in(
+    app: FastAPI,
+    client: AsyncClient,
+    *,
+    email: str = "attorney@firm.test",
+    password: str = "correct-horse-battery-staple",
+) -> None:
+    """Create an account on this app and sign `client` in through the real route.
+
+    For the tests that build their own app rather than taking the `client` fixture.
+    Every route except `/health` and `/auth/*` needs a session now, so a test that
+    constructs its own client has to acquire one — and acquiring it the way a browser
+    does is what keeps these tests honest about the contract.
+
+    Must be called inside the app's lifespan: `app.state.services` does not exist
+    before it. Idempotent on the account, so a test may call it twice.
+    """
+    services = app.state.services
+    if await services.users.by_email(email) is None:
+        await services.auth.create_user(email=email, name="Test Attorney", password=password)
+    response = await client.post("/auth/signin", json={"email": email, "password": password})
+    assert response.status_code == 200, response.text

@@ -197,3 +197,51 @@ CREATE TABLE IF NOT EXISTS deletion_jobs (
     completed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_deletion_pending ON deletion_jobs(status, requested_at);
+
+-- ---------------------------------------------------------------------------
+-- Phase 2 identity (BRD §6.1, §10 Phase 2).
+--
+-- `users.id` is what every other table's `owner_id` points at. There is no foreign
+-- key from those tables to this one, deliberately: they were written in Phase 1 with
+-- a stand-in owner (`owner-local`) and already hold rows, so a FK added now would
+-- either reject the existing data or require a migration the BRD said this design
+-- was meant to avoid. The first user created adopts `owner-local` precisely so that
+-- Phase 1 data stays reachable instead of becoming orphaned.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS users (
+    id            TEXT PRIMARY KEY,
+    -- Stored lowercased. The UNIQUE index is what makes "email already registered" a
+    -- database guarantee rather than a check-then-insert race.
+    email         TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL,
+    -- scrypt, as `scrypt$n$r$p$salt$hash` with both halves base64. The parameters
+    -- live in the string rather than in configuration so a hash written under one
+    -- cost still verifies after the cost is raised.
+    password_hash TEXT NOT NULL,
+    -- 0 disables sign-in without deleting the row, which deleting would orphan every
+    -- document the person owns.
+    is_active     INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    last_login_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+-- Server-side sessions rather than a self-contained token. Sign-out has to actually
+-- end a session for privileged material (BRD §8.2): a JWT stays valid until it
+-- expires no matter what the server thinks, and the only fix for that is a
+-- revocation list — which is this table, minus the benefit.
+CREATE TABLE IF NOT EXISTS sessions (
+    -- sha256 of the cookie value. The token itself is never stored, so this table
+    -- leaking does not hand anyone a live session.
+    token_hash    TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at    TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    -- Recorded for the audit trail, not for authorisation: binding a session to an
+    -- address breaks every mobile network that reassigns one mid-session.
+    user_agent    TEXT,
+    ip            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);

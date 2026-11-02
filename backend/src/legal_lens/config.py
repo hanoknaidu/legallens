@@ -173,6 +173,79 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 60
     audit_retention_days: int = 365  # NFR-9
 
+    # ---- identity (BRD §6.1, Phase 2) ----------------------------------------
+    #: How long a session survives without use. Slid forward on every authenticated
+    #: request, so this is an idle timeout rather than a hard cap: eight hours is a
+    #: working day, and an attorney who leaves a tab open over lunch should not have
+    #: to sign in again.
+    session_ttl_seconds: int = 8 * 60 * 60
+
+    #: `Secure` on the session cookie — HTTPS only. On in prod, off elsewhere, because
+    #: a Secure cookie is simply never sent over the plain-HTTP origin a developer
+    #: runs locally, and the symptom is a sign-in that appears to succeed and then
+    #: does nothing.
+    session_cookie_secure: bool | None = None
+
+    #: scrypt cost. Lowered automatically under `environment="test"`: at the
+    #: production cost every test that signs in pays ~90ms, which across the suite is
+    #: minutes of waiting to prove nothing about the hash parameters.
+    scrypt_n: int | None = None
+
+    #: Whether the API actually requires a session.
+    #:
+    #: **Off by default, and there is no sign-in UI.** The frontend has no login
+    #: page: the app opens straight into the chat, and no route checks a cookie.
+    #: Every request is attributed to the single Phase 1 owner, which is exactly how
+    #: the service behaved before authentication existed.
+    #:
+    #: The implementation behind this flag is real and tested — `true` restores
+    #: sessions, hashing, throttling, per-user isolation and the 401s. But the
+    #: browser app cannot sign in any more, so with it on the API is usable only by a
+    #: client that drives `POST /auth/signin` itself. Turning it on for the SPA means
+    #: restoring a login page first (`docs/auth.md`).
+    #:
+    #: With it off there is no access control at all, and the BRD classes what is
+    #: stored here as privileged attorney-client material (§8.2).
+    require_auth: bool = False
+
+    #: Let an unrecognised email sign in, creating the account on the spot with the
+    #: password submitted.
+    #:
+    #: **This makes the document library self-service.** Anyone who can reach the
+    #: service gets an account, and the BRD classes what is stored here as privileged
+    #: attorney-client material (§8.2). It also gives up the enumeration resistance
+    #: the sign-in route otherwise has: a new address is told its password is too
+    #: short, while a known address is told the credentials are wrong, and the two
+    #: replies are distinguishable.
+    #:
+    #: What it does *not* do: let anyone into an account that already exists. An email
+    #: with an account still needs that account's password, and a disabled account
+    #: stays disabled.
+    #:
+    #: Set `false` to go back to accounts being created only by `auth.cli` or by
+    #: first-run bootstrap.
+    open_signin: bool = True
+
+    #: First-run bootstrap, for a container that has no shell to run the CLI in. Both
+    #: must be set, and they are used only when the users table is empty — so leaving
+    #: them in the environment does not reset anybody's password on the next restart.
+    bootstrap_email: str = ""
+    bootstrap_password: str = ""
+
+    @property
+    def cookie_secure(self) -> bool:
+        if self.session_cookie_secure is not None:
+            return self.session_cookie_secure
+        return self.environment == "prod"
+
+    @property
+    def password_scrypt_n(self) -> int:
+        if self.scrypt_n is not None:
+            return self.scrypt_n
+        from .auth.passwords import DEFAULT_N
+
+        return 2**12 if self.environment == "test" else DEFAULT_N
+
     @model_validator(mode="after")
     def _inherit_plain_anthropic_key(self) -> Settings:
         """Accept the unprefixed `ANTHROPIC_API_KEY` as well.

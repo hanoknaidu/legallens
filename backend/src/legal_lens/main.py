@@ -21,10 +21,10 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
-from .api import audit, chat, conversations, documents, exports, matters, platform
+from .api import audit, auth, chat, conversations, documents, exports, matters, platform
 from .config import PHASE1_OWNER_ID, Settings, get_settings
 from .db.session import Database
-from .errors import register_error_handlers
+from .errors import ApiProblem, register_error_handlers
 from .middleware import register_rate_limit
 from .observability import METRICS, configure_logging, new_request_id, request_id_var
 from .services import Services
@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 API_PREFIX = "/api"
 ROUTERS = (
     platform.router,
+    auth.router,
     matters.router,
     conversations.router,
     documents.router,
@@ -56,6 +57,35 @@ def _metric_route(request: Request) -> str:
     return f"{API_PREFIX}{template}" if template else UNMATCHED_ROUTE
 
 
+async def _bootstrap_first_user(services: Services, settings: Settings) -> None:
+    """Create the first account from the environment, if asked and if there is none.
+
+    A container has no shell to run `python -m legal_lens.auth.cli` in, so a fresh
+    deployment would otherwise come up with a sign-in page and no way past it. Guarded
+    twice: both variables must be set, and the users table must be empty — so leaving
+    them in the environment cannot reset an existing account's password on restart.
+    """
+    if not (settings.bootstrap_email and settings.bootstrap_password):
+        return
+    if await services.users.count() > 0:
+        log.info("bootstrap skipped: an account already exists")
+        return
+    try:
+        user = await services.auth.create_user(
+            email=settings.bootstrap_email,
+            name=settings.bootstrap_email.split("@")[0],
+            password=settings.bootstrap_password,
+        )
+    except ApiProblem as exc:
+        # A refused bootstrap must not stop the service: the operator can still create
+        # an account with the CLI, and a service that will not boot teaches them less
+        # than a log line that names the problem.
+        log.error("bootstrap failed", extra={"reason": exc.code, "detail": exc.detail})
+        return
+    await services.bootstrap_owner(user.id)
+    log.info("bootstrap created the first account", extra={"user_id": user.id})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Own the resources whose lifetime is the process's.
@@ -74,16 +104,51 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     services = Services(db, settings)
     app.state.services = services
     await services.bootstrap(PHASE1_OWNER_ID)
+    await _bootstrap_first_user(services, settings)
+
+    # An expired session row is dead weight that `session_user` already ignores;
+    # clearing it at boot keeps the table from growing without bound in a deployment
+    # that restarts regularly. Not a scheduled job: one statement on a table with one
+    # row per sign-in does not need one.
+    purged = await services.users.purge_expired_sessions()
+    if purged:
+        log.info("purged expired sessions", extra={"count": purged})
 
     # Ingestion writes original bytes here, and a failure to write is only
     # discoverable at upload time otherwise — by which point the user has waited
     # through a 50MB POST. /health probes it instead.
     settings.objects_path.mkdir(parents=True, exist_ok=True)
 
+    if not settings.require_auth:
+        # The loudest line this service logs. A showcase build has no access control
+        # whatsoever, and the way that becomes a real problem is by being forgotten.
+        log.warning(
+            "SHOWCASE BUILD: authentication is NOT enforced — every request is the demo user",
+            extra={
+                "setting": "LEGAL_LENS_REQUIRE_AUTH",
+                "consequence": "anyone who can reach this service can read and upload documents",
+                "enable_with": "LEGAL_LENS_REQUIRE_AUTH=true",
+            },
+        )
+    elif settings.open_signin:
+        # Loud, every boot, and a warning rather than info. An open document library
+        # is a deliberate configuration, and the failure mode of a deliberate
+        # configuration is that everyone forgets it is set.
+        log.warning(
+            "open sign-in is ON: any email that signs in gets an account",
+            extra={
+                "setting": "LEGAL_LENS_OPEN_SIGNIN",
+                "consequence": "anyone who can reach this service can read and upload documents",
+                "disable_with": "LEGAL_LENS_OPEN_SIGNIN=false",
+            },
+        )
+
     log.info(
         "service started",
         extra={
             "environment": settings.environment,
+            "require_auth": settings.require_auth,
+            "open_signin": settings.open_signin,
             "db": str(settings.db_path),
             "llm_provider": settings.llm_provider,
             "vector_store": settings.vector_store,
@@ -112,14 +177,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
 
-    # Credentials off: Phase 1 has no session, so this list bounds which origins may
-    # call the API, not which may carry a cookie (config.cors_origins). In dev the
-    # frontend comes through the Vite proxy and is same-origin, so this is a
-    # belt-and-braces bound rather than the thing holding the browser back.
+    # Credentials on, now that there is a session to carry. This is why
+    # `cors_origins` may never become `["*"]`: a wildcard origin with credentials is
+    # rejected by browsers outright, and if it were not, it would let any site on the
+    # internet make authenticated calls with the user's cookie. In dev and in the
+    # Docker stack the frontend is same-origin through a proxy, so this list is the
+    # bound on everything else rather than the thing holding the browser back.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
-        allow_credentials=False,
+        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["X-Request-Id"],

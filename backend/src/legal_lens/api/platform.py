@@ -68,6 +68,20 @@ def _ocr_state(services, settings: Settings) -> str:
     return f"enabled but unavailable: {reason or 'engine could not be built'}"
 
 
+def _auth_state(settings: Settings) -> str:
+    """Which of the three access postures this build is running.
+
+    Reported rather than left to the environment, because "can anyone read these
+    documents?" should be answerable from the outside, and a showcase build left
+    running somewhere real is the mistake worth catching.
+    """
+    if not settings.require_auth:
+        return "ok (SHOWCASE BUILD: no sign-in required, every request is the demo user)"
+    if settings.open_signin:
+        return "ok (open sign-in: any email gets an account)"
+    return "ok (accounts created by an operator)"
+
+
 @router.get("/health", response_model=HealthResponse)
 async def health(services: ServicesDep, settings: SettingsDep) -> HealthResponse:
     # NFR-8: an unresolved deletion job is the evidence that a purge is incomplete,
@@ -91,6 +105,10 @@ async def health(services: ServicesDep, settings: SettingsDep) -> HealthResponse
         # The in-memory store is a supported Phase 1 configuration, not a missing
         # dependency, so it reports ok and names itself.
         "vector_store": _vector_store_state(services, settings),
+        # Open sign-in is a supported configuration, so it reports ok — but it names
+        # itself, because "can anyone sign in?" is the sort of thing that should be
+        # answerable without reading the deployment's environment.
+        "auth": _auth_state(settings),
     }
     # Only when that pipeline is the one serving questions. Its index is a third
     # place the text lives, and an empty one is the silent failure on this path:

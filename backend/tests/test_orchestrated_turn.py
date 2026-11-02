@@ -21,7 +21,7 @@ from typing import Any
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
-from helpers import NEW_CONVERSATION, ready_document
+from helpers import NEW_CONVERSATION, ready_document, sign_in
 from legal_lens.ai.types import (
     CitationFound,
     Finished,
@@ -115,6 +115,7 @@ async def orchestrated(tmp_path) -> AsyncIterator[tuple[AsyncClient, ScopeRecord
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test/api") as client:
         async with app.router.lifespan_context(app):
+            await sign_in(app, client)
             app.state.services.generation_provider = provider
             yield client, provider, app.state.services
 
