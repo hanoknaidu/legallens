@@ -1,14 +1,17 @@
 # CI
 
-Two workflows, both in `.github/workflows/` **at the repository root** — not
-under `backend/`, where they were first written. Actions only reads workflows
-from the root, so a workflow filed in a subdirectory never runs at all.
+One workflow, `ci.yml`, in `.github/workflows/` **at the repository root** — not
+under `backend/`, where it was first written. Actions only reads workflows from
+the root, so a workflow filed in a subdirectory never runs at all.
 
 `ci.yml` is the gate on `main`: ruff and the unit suite on two interpreters, the
-production image built and booted, and the frontend typechecked and built — with
-a browsable HTML test report and coverage report attached to every run.
-`ci-retrieval.yml` carries the tests that load real models, which are too
-expensive to put on every PR.
+retrieval tests against real models, the production image built and booted, and
+the frontend linted, typechecked and built — with a browsable HTML test report
+and coverage report attached to every run.
+
+There used to be a second workflow, `ci-retrieval.yml`, holding the retrieval
+tests on the theory that they were too expensive to gate. See
+[Why there is one workflow](#why-there-is-one-workflow).
 
 No secrets. Nothing in CI makes a network call to the vendor, so there is no
 `ANTHROPIC_API_KEY` in either workflow and nothing asks for one. That is a
@@ -21,9 +24,8 @@ The git root is `Legal Lens/`, so `frontend/`, `e2e/` and `intent-classifier/`
 are all in the checkout. These two workflows nonetheless check `backend/` only:
 every job sets `working-directory: backend` for its `run:` steps, and the paths
 handed to actions — setup-uv's `cache-dependency-glob`, the Docker build
-`context`, `upload-artifact`'s `path`, and ci-retrieval's path filters — are
-spelled `backend/...` relative to the root, because an action's own inputs
-ignore `working-directory`. The other three components have no CI yet; they need
+`context` and `upload-artifact`'s `path` — are spelled `backend/...` relative to
+the root, because an action's own inputs ignore `working-directory`. The other three components have no CI yet; they need
 their own jobs.
 
 Two backend tests read across into the siblings — `test_conversation_titles.py`
@@ -51,9 +53,10 @@ opening the PR is what first exercises it.
 | `docker` | builds the default image and boots it — see [Docker](#docker) | yes |
 | `frontend` | `npm ci`, `npm run lint`, `npm run typecheck`, `npm run build`; uploads the bundle | yes |
 | `e2e-specs` | `playwright test --list`, asserting 73 tests in 9 files | yes |
+| `retrieval` | the 34 tests that load real models and a real vector store | yes |
 | `ci` | one aggregate check to require in branch protection | yes |
 
-The five run in parallel; `ci` waits on all of them. Each job sets its own
+The six run in parallel; `ci` waits on all of them. Each job sets its own
 `working-directory` — `backend/`, `frontend/` or `e2e/` — because no component
 sits at the repository root.
 
@@ -119,6 +122,29 @@ functions (`spanPattern`, `findSpan`, `STATUS_META`) exported beside a
 component, which costs fast refresh in dev and nothing in production. Reworking
 five components' state synchronisation, in a codebase with no frontend unit
 tests, is its own task with its own review.
+
+### Why there is one workflow
+
+The retrieval tests — the 34 in `test_orchestrator_retrieval.py` and
+`test_orchestrated_retrieval.py` — lived in their own workflow,
+`ci-retrieval.yml`, path-filtered and outside the required check. The reasoning
+was cost: the `workflows` extra pulls torch, the CUDA runtime and triton, and
+the suite was expected to download ~4.5GB of weights on its first question.
+
+Measured, it does not. The first run ever, on a cold cache with nothing to
+restore from, took **1m35s wall clock with 34 tests passing in 23.73s**. So the
+split was buying nothing and costing something real: a job outside the aggregate
+can go red without stopping a merge, and a path-filtered job skips most PRs
+entirely. It is a job in `ci.yml` now, and it blocks.
+
+Its `timeout-minutes` came down from 60 to 30 in the move. Sixty was harmless
+for a job that gated nothing; now that the aggregate waits on it, the timeout is
+how long a hang can hold a PR.
+
+The daily `schedule` trigger came along with it and now applies to the whole
+gate, which is a superset of what it was for. Note that a scheduled run only
+fires from the default branch, and GitHub disables the schedule after 60 days of
+repository inactivity.
 
 ### Triggers
 
@@ -197,7 +223,7 @@ them.
 
 | Skip | Why |
 |---|---|
-| `test_orchestrator_retrieval.py` | `workflows` extra absent by design — `ci-retrieval.yml` owns it |
+| `test_orchestrator_retrieval.py` | `workflows` extra absent by design — the `retrieval` job owns them |
 
 `-rs` prints the reason into the log, so a *new* skip shows up rather than being
 quietly absorbed into the count.
@@ -285,34 +311,27 @@ the default docker driver cannot use it.
 The job **never pushes.** Publishing is CD's job and needs a registry credential
 this workflow deliberately does not hold.
 
-## `ci-retrieval.yml` — the retrieval stack
+## The `retrieval` job
 
-`tests/test_orchestrator_retrieval.py` is the one file that loads actual models
-and runs an actual vector store. The `workflows` extra pulls torch, the CUDA
-runtime and triton — several GB a CPU runner never executes — and the suite then
-downloads ~4.5GB of weights (`BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3`,
-`Qdrant/bm25`). See the measured image sizes in [DOCKER.md](DOCKER.md).
+`test_orchestrator_retrieval.py` and `test_orchestrated_retrieval.py` are the
+only files that load actual models and run an actual vector store — 34 tests.
+They need the `workflows` extra, which pulls torch, the CUDA runtime and triton,
+so the other three Python jobs leave it out and those tests `importorskip`
+themselves there. That skip is the one the `test` job reports.
 
-So it is split out, with three triggers that keep it genuinely gated rather than
-merely scheduled:
+The model weights (`BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3`, `Qdrant/bm25`) are
+cached with `actions/cache` under a key named for the models rather than for the
+lockfile, since they change when `DEFAULT_EMBED_MODEL` / `DEFAULT_RERANK_MODEL`
+change, not when a wheel does. `restore-keys` lets a run with a changed key
+start from the last download rather than from nothing.
 
-- **`pull_request`, path-filtered** — a PR touching `orchestrator/`,
-  `retrieval/`, either retrieval test, `pyproject.toml` or `uv.lock` does get
-  checked before merge
-- **`schedule`**, 07:00 UTC daily — a break from a dependency bump surfaces
-  within a day. Note that scheduled workflows run only from the default branch,
-  and GitHub disables them after 60 days of repository inactivity
-- **`workflow_dispatch`** — before merging something risky
+It runs on 3.14 only — the point is the retrieval stack, not interpreter
+coverage, and a matrix would double a multi-GB install. And no coverage: it runs
+two files, so its percentage would read as a project total while measuring a
+slice of it. The `test` job owns the coverage number.
 
-The weights are cached (`actions/cache`) under a key named for the models rather
-than for the lockfile, since they change when `DEFAULT_EMBED_MODEL` /
-`DEFAULT_RERANK_MODEL` change, not when a wheel does. A cold run is slow enough
-to justify `timeout-minutes: 60`; a warm one is a few minutes. It runs on 3.14
-only — the point is the retrieval stack, not interpreter coverage, and a matrix
-would double a multi-GB download.
-
-No coverage here: it runs two files, so its percentage would read as a project
-total while measuring a slice of it. `ci.yml` owns the coverage number.
+For why this is a job here rather than its own workflow, see
+[Why there is one workflow](#why-there-is-one-workflow).
 
 ## Pinned versions
 
@@ -322,9 +341,16 @@ rewrite the lockfile differently, which would let CI pass against a dependency
 set the production image never builds. Bump it here and in the Dockerfile
 together.
 
-Actions are pinned to major tags: `actions/checkout@v7`,
-`astral-sh/setup-uv@v10`, `actions/upload-artifact@v7`, `actions/cache@v6`,
-`docker/setup-buildx-action@v4`, `docker/build-push-action@v7`.
+Actions are pinned to major tags — `actions/checkout@v7`,
+`actions/upload-artifact@v7`, `actions/cache@v6`, `actions/setup-node@v7`,
+`docker/setup-buildx-action@v4`, `docker/build-push-action@v7` — with one
+exception. **`astral-sh/setup-uv` is pinned to the full `v10.3.3`**, because
+astral-sh stopped publishing the floating major alias after `v7`: `@v10` matches
+no ref, and a job that asks for it fails at "Set up job" before a step runs.
+That is not hypothetical — it is how the first run of this pipeline failed. When
+bumping it, check that the tag you pick actually exists.
+
+Node comes from `.nvmrc` at the repository root rather than a pin here.
 
 ## Not covered yet
 

@@ -10,7 +10,8 @@
 #     docker     build the production image and prove it boots and reports ok
 #     frontend   lint, typecheck and build the bundle that actually ships
 #     e2e-specs  prove the 73 Playwright specs still load and collect
-#        \__________________ all five ____________________/
+#     retrieval  the tests that load real models and a real vector store
+#        \__________________ all six _____________________/
 #                              |
 #                             ci   the one check branch protection requires
 #
@@ -18,8 +19,14 @@
 # package release, no PR comment — the token below is read-only and CD owns
 # everything downstream of a green run.
 #
-# What lives elsewhere: the GPU-weight retrieval tests (the `workflows` extra,
-# several GB of torch/CUDA) run in ci-retrieval.yml, not here.
+# What used to live elsewhere: the retrieval tests had their own workflow,
+# ci-retrieval.yml, kept out of the gate because the `workflows` extra pulls
+# torch and the CUDA runtime and the suite was expected to download ~4.5GB of
+# model weights on its first question. Measured, it does not: the first run ever,
+# on a cold cache with nothing to restore, finished in 1m35s with 34 tests
+# passing in 23.73s of test time. The reason for keeping it separate did not
+# survive the numbers, and a suite outside the required check is one that can go
+# red without stopping a merge — so it is a job here now, and it blocks.
 #
 # What is deliberately not gated: running the e2e suite, and the standalone
 # intent classifier. Both need a real ANTHROPIC_API_KEY — the e2e run cost $1.35
@@ -53,11 +60,20 @@ name: CI
 # path-filtered required check never reports on a PR outside its filter, which
 # leaves branch protection waiting on a check that will never arrive. Every job
 # runs on every PR; the slowest is about a minute.
+#
+# The `schedule` entry arrived with the retrieval job when ci-retrieval.yml was
+# folded in. Its purpose was to surface a break from a dependency bump within a
+# day, and running the whole gate daily is a superset of that. Two things worth
+# knowing: a scheduled run only ever fires from the default branch, and GitHub
+# disables the schedule after 60 days of repository inactivity.
 on:
   pull_request:
     branches: [main]
   push:
     branches: [main]
+  schedule:
+    # 07:00 UTC daily.
+    - cron: "0 7 * * *"
   workflow_dispatch:
 
 # A second push to a PR makes the first run's verdict irrelevant, so stop it and
@@ -95,10 +111,10 @@ env:
 # between them, because those imports sit inside functions and so are invisible
 # at collection time.
 #
-# `workflows` is deliberately absent: it pulls torch, the CUDA runtime and triton
-# — several GB a CPU runner never executes — for the 21 tests in
-# test_orchestrator_retrieval.py, which `importorskip` themselves without it.
-# ci-retrieval.yml runs those separately.
+# `workflows` is deliberately absent from those three: it pulls torch, the CUDA
+# runtime and triton for the 34 retrieval tests, which `importorskip` themselves
+# without it. The `retrieval` job below installs it and runs them, so they are
+# gated — just not four times over, once per interpreter and once per extras set.
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -206,7 +222,7 @@ jobs:
       #
       # Expect: 336 passed, 1 skipped. The one skip is structural, not a failure
       # — the `workflows` extra is absent by design, so the retrieval tests
-      # `importorskip` themselves and ci-retrieval.yml runs them instead. The two
+      # `importorskip` themselves and the `retrieval` job runs them instead. The two
       # tests that read `frontend/` and `intent-classifier/` are in the 336: both
       # folders are in this repository, so they assert rather than skip. `-rs`
       # prints each reason into the log so a new skip is visible rather than
@@ -465,6 +481,96 @@ jobs:
           }
 
   # ---------------------------------------------------------------------------
+  # Retrieval: the only tests that load real models and a real vector store.
+  # ---------------------------------------------------------------------------
+  # The 34 tests in test_orchestrator_retrieval.py and
+  # test_orchestrated_retrieval.py. They need the `workflows` extra — torch, the
+  # CUDA runtime, triton — which is why the other Python jobs leave it out, and
+  # why those tests `importorskip` themselves there and account for the `test`
+  # job's one structural skip.
+  #
+  # This was ci-retrieval.yml. Folded in because the cost it was avoiding turned
+  # out not to be real, and because advisory was the worse trade: it could go red
+  # without blocking anything.
+  retrieval:
+    name: Retrieval tests (real models)
+    runs-on: ubuntu-latest
+    # Was 60 when this job blocked nothing. The aggregate waits on it now, so a
+    # hang holds a PR for as long as this allows and the bound is nearer what the
+    # job takes: ~20x headroom over the observed 1m35s, which still covers a cold
+    # run fetching multi-GB wheels.
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      # Pin the model caches to paths the cache step can restore. HF_HOME is
+      # respected by sentence-transformers, which loads the embedder and the
+      # reranker. FASTEMBED_CACHE_PATH steers fastembed's BM25 weights
+      # (Qdrant/bm25, small); if the installed fastembed ignores it, that cache
+      # simply misses and re-downloads — it does not break the run.
+      HF_HOME: /home/runner/.cache/huggingface
+      FASTEMBED_CACHE_PATH: /home/runner/.cache/fastembed
+      # Keep torch off the GPU paths it would look for on a CPU runner.
+      CUDA_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+          # Only 3.14 here, matching the Dockerfile and .venv. The point of this
+          # job is the retrieval stack, not interpreter coverage, and doubling it
+          # would double a multi-GB install.
+          python-version: "3.14"
+
+      # Keyed on the model names rather than the lockfile: the weights change
+      # when DEFAULT_EMBED_MODEL / DEFAULT_RERANK_MODEL change, not when a wheel
+      # does. restore-keys lets a run with a changed key start from the last
+      # download instead of from nothing.
+      - name: Restore the model cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            /home/runner/.cache/huggingface
+            /home/runner/.cache/fastembed
+          key: models-${{ runner.os }}-bge-m3-bge-reranker-v2-m3-qdrant-bm25
+          restore-keys: |
+            models-${{ runner.os }}-
+
+      # `workflows` on top of the standard set. This is the install that costs
+      # minutes; the two cache steps above exist to make it cheap on a rerun.
+      - name: Run the retrieval tests
+        env:
+          # Same reason as the `test` job: a shared runner is slower than any
+          # developer machine, and the polling budget in tests/helpers.py is
+          # tight by design.
+          LEGAL_LENS_TEST_TERMINAL_TIMEOUT_S: "60"
+        run: |
+          uv run --frozen \
+            --extra dev --extra ocr --extra orchestrator --extra workflows \
+            pytest tests/test_orchestrator_retrieval.py tests/test_orchestrated_retrieval.py \
+              --html=reports/retrieval-report.html \
+              --self-contained-html \
+              --junitxml=reports/retrieval-junit.xml \
+              -q -rs
+
+      # No coverage here: this job runs two files, so its percentage would read
+      # as a project total while measuring a slice of it. The `test` job owns the
+      # coverage number.
+      - name: Upload the HTML report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-retrieval-reports
+          path: backend/reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
   # The single check to require in branch protection.
   # ---------------------------------------------------------------------------
   # A matrix job's name carries the matrix value ("Tests (py3.12)"), so requiring
@@ -475,7 +581,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [quality, test, docker, frontend, e2e-specs]
+    needs: [quality, test, docker, frontend, e2e-specs, retrieval]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -486,9 +592,11 @@ jobs:
           echo "docker:    ${{ needs.docker.result }}"
           echo "frontend:  ${{ needs.frontend.result }}"
           echo "e2e-specs: ${{ needs.e2e-specs.result }}"
+          echo "retrieval: ${{ needs.retrieval.result }}"
           [ "${{ needs.quality.result }}" = "success" ] || exit 1
           [ "${{ needs.test.result }}" = "success" ] || exit 1
           [ "${{ needs.docker.result }}" = "success" ] || exit 1
           [ "${{ needs.frontend.result }}" = "success" ] || exit 1
           [ "${{ needs['e2e-specs'].result }}" = "success" ] || exit 1
+          [ "${{ needs.retrieval.result }}" = "success" ] || exit 1
           echo "All required checks passed."
