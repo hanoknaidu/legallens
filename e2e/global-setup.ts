@@ -1,14 +1,7 @@
-import path from "node:path";
 import { request } from "@playwright/test";
 
 const API = process.env.E2E_API_URL ?? "http://127.0.0.1:8000";
 const UI = process.env.E2E_BASE_URL ?? "http://localhost:5173";
-
-/** Where the signed-in cookie jar is written. `use.storageState` reads it. */
-export const STORAGE_STATE = path.resolve(__dirname, ".auth/state.json");
-
-const EMAIL = process.env.E2E_EMAIL ?? "attorney@firm.test";
-const PASSWORD = process.env.E2E_PASSWORD ?? "";
 
 /**
  * Refuses to run against a half-started stack.
@@ -66,54 +59,14 @@ export default async function globalSetup() {
   // through the form keeps that one flow under test in `10-auth.spec.ts` instead of
   // repeated 73 times as setup.
   // ---------------------------------------------------------------------
-  // These specs drive the authenticated app: they assert 401s, sign-in failures and
-  // per-user isolation, none of which exist in a showcase build. Running them against
-  // one produces a wall of failures that say nothing about the app, so it stops here
-  // instead — the same policy as the checks above.
-  const session = await ctx.get(`${API}/api/auth/session`, { timeout: 10_000 });
-  const authRequired = Boolean((await session.json()).authRequired);
-  if (!authRequired) {
-    throw new Error(
-      "The backend is a showcase build (LEGAL_LENS_REQUIRE_AUTH=false), where no " +
-        "route requires a session.\n\n" +
-        "These tests drive the authenticated app. Start the backend with:\n\n" +
-        "  cd backend && LEGAL_LENS_REQUIRE_AUTH=true \\\n" +
-        "    LEGAL_LENS_LLM_PROVIDER=orchestrator uv run uvicorn legal_lens.main:app --port 8000\n",
-    );
-  }
-
-  if (!PASSWORD) {
-    throw new Error(
-      "E2E_PASSWORD is not set, and the app needs a session.\n\n" +
-        "  export E2E_EMAIL=attorney@firm.test\n" +
-        "  export E2E_PASSWORD=...\n\n" +
-        "Create the account first if it does not exist:\n" +
-        "  cd backend && uv run python -m legal_lens.auth.cli create attorney@firm.test\n",
-    );
-  }
-
-  const signIn = await ctx.post(`${API}/api/auth/signin`, {
-    data: { email: EMAIL, password: PASSWORD },
-    timeout: 15_000,
-  });
-  if (!signIn.ok()) {
-    const body = await signIn.text().catch(() => "");
-    throw new Error(
-      `Sign-in failed for ${EMAIL} (${signIn.status()}). ${body}\n\n` +
-        "Check the password, or reset it:\n" +
-        `  cd backend && uv run python -m legal_lens.auth.cli passwd ${EMAIL}\n`,
-    );
-  }
-
-  // The cookie is scoped to /api and HttpOnly, so it cannot be set from page script —
-  // saving the context's own state is what carries it into the browser.
-  await ctx.storageState({ path: STORAGE_STATE });
-
+  // No sign-in step: the app has no login page, and the API is not enforcing
+  // sessions (docs/auth.md). If it is ever run with `LEGAL_LENS_REQUIRE_AUTH=true`
+  // these specs will fail on 401s, which is the honest signal — there would be no UI
+  // to acquire a session through.
   // eslint-disable-next-line no-console
   console.log(
     `\n  backend ${API} · status=${health.status} · llm=${llm}` +
-      `\n  orchestrator=${checks.orchestrator ?? "n/a"}` +
-      `\n  signed in as ${EMAIL}\n`,
+      `\n  orchestrator=${checks.orchestrator ?? "n/a"}\n`,
   );
 
   await ctx.dispose();

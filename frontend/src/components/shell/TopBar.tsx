@@ -5,7 +5,6 @@ import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
-import { UserMenu } from "@/components/auth/UserMenu";
 import { useUIStore } from "@/stores/useUIStore";
 import { useDocPanelStore } from "@/stores/useDocPanelStore";
 
@@ -131,8 +130,6 @@ export function TopBar({
           </Button>
         </Tooltip>
       )}
-
-      <UserMenu />
     </header>
   );
 }

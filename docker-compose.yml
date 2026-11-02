@@ -48,8 +48,9 @@ services:
       # cannot reset an existing password. Override before first boot, or create
       # further accounts with
       #   docker compose exec backend python -m legal_lens.auth.cli create you@firm.com
-      # A showcase build: the login page is a demonstration and no route requires a
-      # session. Set true for real authentication (docs/auth.md).
+      # No sign-in: the app opens straight into the chat and no route requires a
+      # session. `true` enforces sessions at the API, but the frontend has no login
+      # page to get one through (docs/auth.md).
       LEGAL_LENS_REQUIRE_AUTH: "${LEGAL_LENS_REQUIRE_AUTH:-false}"
       # Only applies when REQUIRE_AUTH is on. Any email that signs in gets an
       # account. Convenient locally; for anything

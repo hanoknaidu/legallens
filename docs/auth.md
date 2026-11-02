@@ -10,33 +10,40 @@ constant and now resolves a session cookie; every router that already took `Owne
 became authenticated without being edited, because every query was already filtering
 on the value it returns.
 
-## The shipped default is a showcase build
+## There is no sign-in in the app
 
-**`LEGAL_LENS_REQUIRE_AUTH` is off.** The login page is a demonstration of the flow:
-Sign In is a transition into the chat, no credentials are checked, nothing is sent,
-and no API route requires a session. Every request is attributed to the single Phase 1
-owner — which is exactly how the service behaved before authentication existed, so the
-app behind the demo is fully working rather than an empty shell.
+**The frontend has no login page.** It was built, demonstrated and then removed at
+the owner's request; the app opens straight into the chat session. Nothing in the UI
+signs in, signs out, or shows who you are.
 
-The gate that makes the login page appear at all is a `sessionStorage` flag
-(`frontend/src/lib/demoSession.ts`). It is not a credential and protects nothing; it
-exists so "signed in" is a state the demo can enter and leave, and so the transition
-can be shown more than once per tab.
+**`LEGAL_LENS_REQUIRE_AUTH` is off** to match. No API route requires a session, and
+every request is attributed to the single Phase 1 owner — exactly how the service
+behaved before authentication existed. There is no access control at all, and the BRD
+classes what is stored here as privileged attorney-client material (§8.2), so this is
+a build for a laptop and a demo rather than for a deployment.
 
-A showcase build announces itself three ways, because one left running somewhere real
-is the mistake worth catching:
+It announces itself, because a build with no access control left running somewhere
+real is the mistake worth catching:
 
 - a `WARNING` at every boot — `SHOWCASE BUILD: authentication is NOT enforced`
 - `/api/health` → `"auth": "ok (SHOWCASE BUILD: no sign-in required, …)"`
-- the login page itself — "Demonstration — sign in with anything to continue."
 
-Everything below describes what `LEGAL_LENS_REQUIRE_AUTH=true` turns on. It is
-implemented and tested, not a sketch: sessions, hashing, throttling, per-user
-isolation and the 401s all come back with nothing else to change.
+### What survives, and what turning the flag on would and would not give you
 
-```bash
-LEGAL_LENS_REQUIRE_AUTH=true     # the real thing
-```
+The backend implementation is intact and still tested: `users` and `sessions` tables,
+scrypt hashing, server-side sessions, sign-in throttling, the account CLI, and
+per-user isolation enforced by `deps.current_owner_id`. `LEGAL_LENS_REQUIRE_AUTH=true`
+brings all of it back at the API, and the test suite covers it.
+
+**What it would not give you is a usable browser app.** With enforcement on and no
+login page, the SPA's first request gets a 401 and there is no screen to resolve it —
+the API would be usable only by a client that drives `POST /auth/signin` itself.
+Turning authentication on for the browser means restoring a login page first. The one
+that was removed lived at `frontend/src/pages/LoginPage.tsx` with a route guard at
+`components/auth/RequireAuth.tsx`; both are in the history of this branch rather than
+gone.
+
+The e2e suite drives the app as it is now — no sign-in step, 73 specs in 9 files.
 
 ## What it is, with authentication on
 
@@ -189,8 +196,7 @@ Stated rather than papered over.
    expiry — a feature, not an omission to fix in passing.
 5. **No MFA, no password history, no rotation policy.** All reasonable asks for a
    firm handling privileged material, and all out of scope here.
-6. **The e2e suite needs the real build.** `e2e/global-setup.ts` refuses to run
-   against a showcase build rather than producing 79 failures that say nothing.
+6. **There is no login page**, so `REQUIRE_AUTH=true` is API-only — see above.
 7. **Open sign-in is on by default** when authentication is on, which trades away enumeration
    resistance and means the service is self-service unless configured otherwise.
 8. **Sign-in events go to the log, not to `audit_log`.** That table's shape is
@@ -211,8 +217,8 @@ cleaner and orphans everything already uploaded.
 
 ## Tests
 
-`backend/tests/test_auth.py`, 49 tests, covering all three postures — showcase,
-open sign-in and operator-created accounts — including both sign-in modes — the open-mode
+`backend/tests/test_auth.py`, 49 tests, covering all three postures — enforcement
+off, open sign-in, and operator-created accounts — including both sign-in modes — the open-mode
 boundaries above, and a `strict_client` fixture that pins the byte-identical replies
 `open_signin=false` restores. The one that justifies the rest:
 `test_one_user_cannot_see_another_users_documents` drives two real sessions through

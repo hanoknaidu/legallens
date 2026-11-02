@@ -8,7 +8,6 @@ import type {
   LegalDocument,
   Matter,
   Message,
-  SessionUser,
 } from "@/types/domain";
 
 /**
@@ -17,40 +16,16 @@ import type {
  * Nothing above this file knows the data is mocked. Pointing at the real
  * FastAPI backend means changing API_BASE and not registering the MSW worker.
  */
-/**
- * Called when the server says the session is gone.
- *
- * A module-level hook rather than a thrown error the caller must remember to catch:
- * a session can lapse during any request, and every screen in the app would otherwise
- * need the same handling. `RequireAuth` registers the redirect.
- */
-let onUnauthenticated: (() => void) | null = null;
-
-export function setUnauthenticatedHandler(handler: (() => void) | null) {
-  onUnauthenticated = handler;
-}
-
-/** Routes whose 401 is an answer rather than an expiry — see `request()`. */
-const AUTH_PATHS = ["/auth/signin", "/auth/session", "/auth/signout"];
-
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
-    // The session is an HttpOnly cookie, so it is attached by the browser rather than
-    // by this code — but only if credentials are asked for. Without this line every
-    // request is anonymous and the whole app 401s.
+    // Kept although the UI has no sign-in: the API can still be run with
+    // `LEGAL_LENS_REQUIRE_AUTH=true` (docs/auth.md), and without this the cookie a
+    // session would need is never sent. Costs nothing when nothing is enforcing.
     credentials: "include",
     ...init,
   });
-  if (!res.ok) {
-    const error = await ApiError.fromResponse(res, `${init?.method ?? "GET"} ${path}`);
-    // A 401 from a normal route means the session lapsed or was revoked, and the only
-    // useful response is to send the user to sign in again. A 401 from the sign-in
-    // route means the password was wrong, which the form shows in place — redirecting
-    // there would throw away the message the user needs to read.
-    if (res.status === 401 && !AUTH_PATHS.includes(path)) onUnauthenticated?.();
-    throw error;
-  }
+  if (!res.ok) throw await ApiError.fromResponse(res, `${init?.method ?? "GET"} ${path}`);
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
@@ -152,20 +127,6 @@ export function saveBlob(blob: Blob, filename: string) {
 
 export const api = {
   health: () => request<HealthResponse>("/health"),
-
-  auth: {
-    /** Who is signed in, or `{ user: null }`. A 200 either way — see the backend route. */
-    session: () =>
-      request<{ user: SessionUser | null; openSignin: boolean; authRequired: boolean }>(
-        "/auth/session",
-      ),
-    signIn: (body: { email: string; password: string }) =>
-      request<{ user: SessionUser; openSignin: boolean; authRequired: boolean }>("/auth/signin", {
-        method: "POST",
-        body: JSON.stringify(body),
-      }),
-    signOut: () => request<void>("/auth/signout", { method: "POST" }),
-  },
 
   matters: () => request<Matter[]>("/matters"),
 

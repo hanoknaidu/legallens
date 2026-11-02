@@ -9,7 +9,7 @@
 #     test       run the unit suite on py3.12 and py3.14, publish HTML reports
 #     docker     build the production image and prove it boots and reports ok
 #     frontend   lint, typecheck and build the bundle that actually ships
-#     e2e-specs  prove the 79 Playwright specs still load and collect
+#     e2e-specs  prove the 73 Playwright specs still load and collect
 #     retrieval  the tests that load real models and a real vector store
 #        \__________________ all six _____________________/
 #                              |
@@ -442,10 +442,10 @@ jobs:
   # that no longer compiles or imports, which otherwise surfaces only when
   # someone runs the suite by hand and finds a file missing from the count.
   #
-  # Expect: 79 tests in 10 files. The step asserts the file count rather than just
-  # exit zero, because `--list` succeeds on a half-collected suite. The tenth file is
-  # 10-auth.spec.ts; raise this number when a spec file is added, which is the point —
-  # a file that stops being collected should fail here rather than quietly vanish.
+  # Expect: 73 tests in 9 files. The step asserts the file count rather than just
+  # exit zero, because `--list` succeeds on a half-collected suite. Change this number
+  # when a spec file is added or removed, which is the point — a file that stops being
+  # collected should fail here rather than quietly vanish.
   #
   # Actually running these needs a real key, a built frontend and a live
   # backend, and cost $1.35 over 114 model calls when last measured — see
@@ -477,8 +477,8 @@ jobs:
       - name: Collect the specs
         run: |
           npx playwright test --list | tee /tmp/listing.txt
-          grep -qE "Total: [0-9]+ tests in 10 files" /tmp/listing.txt || {
-            echo "::error::expected 10 spec files; the suite did not collect in full"
+          grep -qE "Total: [0-9]+ tests in 9 files" /tmp/listing.txt || {
+            echo "::error::expected 9 spec files; the suite did not collect in full"
             exit 1
           }
 

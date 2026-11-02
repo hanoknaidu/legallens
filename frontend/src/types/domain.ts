@@ -107,12 +107,3 @@ export interface HealthResponse {
   environment: string;
   checks: Record<string, string>;
 }
-
-/** The signed-in user. Mirrors the backend's `SessionUser` (schemas.py). */
-export interface SessionUser {
-  id: string;
-  email: string;
-  name: string;
-  /** ISO 8601. When the session lapses if the user does nothing further. */
-  expiresAt: string;
-}
