@@ -1,0 +1,18 @@
+# The backend's /data: SQLite, uploaded originals, and the live vector index.
+#
+# ReadWriteOnce is the right access mode here rather than a limitation to work
+# around — one disk, one pod, which is exactly what a single-writer SQLite app
+# wants. It is also why the backend Deployment uses `Recreate`: a second pod
+# cannot attach this disk while the first still holds it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: legallens-data
+  labels:
+    app.kubernetes.io/part-of: legal-lens
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: managed-csi
+  resources:
+    requests:
+      storage: 8Gi

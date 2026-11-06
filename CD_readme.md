@@ -149,7 +149,7 @@ az aks create \
   --resource-group $RG \
   --name $AKS_NAME \
   --node-count 1 \
-  --node-vm-size Standard_B2s \
+  --node-vm-size Standard_D4s \
   --tier free \
   --generate-ssh-keys \
   --attach-acr $ACR_NAME
@@ -257,159 +257,62 @@ the portal shows secret values base64-encoded, which is encoding, not encryption
 
 ---
 
-### Step 8 — Storage for the backend
+### Steps 8–10 — The workloads
 
-The PVC is the resource; Azure provisions the actual disk when the pod starts.
+The manifests live in **`k8s/`** and are the same ones CD applies. They are not
+reproduced here on purpose: a copy in a README and a copy in the repository drift,
+and then the one you read is not the one that runs.
 
-`ReadWriteOnce` is correct here, not a limitation to work around: one disk, one pod,
-which is exactly what a single-writer SQLite app wants.
+| File | What it declares |
+|---|---|
+| `k8s/pvc.yaml` | an 8Gi Azure Disk for the backend's `/data` |
+| `k8s/backend.yaml` | the API Deployment, and a **ClusterIP** Service — internal only |
+| `k8s/frontend.yaml` | the UI Deployment, and a **LoadBalancer** Service — the public IP |
 
-```yaml
-# k8s/pvc.yaml
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: legallens-data
-spec:
-  accessModes: ["ReadWriteOnce"]
-  storageClassName: managed-csi       # default Azure Disk class
-  resources:
-    requests:
-      storage: 8Gi
-```
+Four details in them are decisions rather than boilerplate, and each is commented in
+place:
+
+- **`replicas: 1` and `strategy: Recreate`** on the backend. It is single-writer:
+  SQLite takes one writer, the pending-turn registry is in memory, and the image
+  pins `WORKERS=1`. `RollingUpdate` would deadlock regardless — the new pod cannot
+  attach a `ReadWriteOnce` disk the old pod still holds.
+- **`fsGroup: 10001`.** The image runs as that uid. Without it the mounted disk is
+  root-owned, `/data` is not writable, and the error you see is a confusing runtime
+  failure rather than a mount failure.
+- **The backend Service is named `backend` on port 8000.** That is already the
+  frontend image's default `BACKEND_URL`, so the frontend needs no configuration.
+  Rename the Service and you must set `BACKEND_URL` to match.
+- **Probes point at `/api/health` and `/healthz`.** The frontend's is answered by
+  nginx alone — a readiness check that reached through to the API would take the UI
+  out of service whenever the API was briefly unwell.
+
+To apply them **by hand** (CD does this for you — see Part 3). The image tag is a
+placeholder, so substitute it the same way the pipeline does:
 
 ```bash
+export ACR_LOGIN=$(az acr show --name $ACR_NAME --query loginServer --output tsv)
+export BACKEND_IMAGE=$ACR_LOGIN/legallens-backend:v1
+export FRONTEND_IMAGE=$ACR_LOGIN/legallens-frontend:v1
+export LLM_PROVIDER=echo        # or "anthropic" once the Secret from Step 7 exists
+
 kubectl apply -f k8s/pvc.yaml
-kubectl get pvc          # Pending until a pod mounts it — that is normal
-```
+for m in k8s/backend.yaml k8s/frontend.yaml; do
+  envsubst '${BACKEND_IMAGE} ${FRONTEND_IMAGE} ${LLM_PROVIDER}' < "$m" | kubectl apply -f -
+done
 
----
-
-### Step 9 — Deploy the backend
-
-```yaml
-# k8s/backend.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: backend
-spec:
-  replicas: 1                 # must stay 1: SQLite, in-memory registry, WORKERS=1
-  strategy:
-    type: Recreate            # RollingUpdate would deadlock: the new pod cannot
-                              # attach a disk the old pod still holds
-  selector:
-    matchLabels: { app: backend }
-  template:
-    metadata:
-      labels: { app: backend }
-    spec:
-      securityContext:
-        fsGroup: 10001        # the image runs as uid 10001; without this the
-                              # mounted disk is root-owned and /data is read-only
-      containers:
-        - name: backend
-          image: <ACR_LOGIN>/legallens-backend:v1     # substitute your login server
-          ports:
-            - containerPort: 8000
-          env:
-            - name: LEGAL_LENS_LLM_PROVIDER
-              value: "echo"                 # change to "anthropic" once the Secret exists
-            - name: LEGAL_LENS_ENVIRONMENT
-              value: "prod"
-          # Uncomment with the Secret from Step 7:
-          # envFrom:
-          #   - secretRef: { name: legallens-secrets }
-          volumeMounts:
-            - name: data
-              mountPath: /data
-          readinessProbe:
-            httpGet: { path: /api/health, port: 8000 }
-            initialDelaySeconds: 10
-          livenessProbe:
-            httpGet: { path: /api/health, port: 8000 }
-            initialDelaySeconds: 40         # matches the image's start-period
-      volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: legallens-data
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: backend               # the name matters — see the note below
-spec:
-  type: ClusterIP             # internal only; the frontend reaches it, the internet does not
-  selector: { app: backend }
-  ports:
-    - port: 8000
-      targetPort: 8000
-```
-
-> **Why the Service must be called `backend`:** the frontend image defaults to
-> `BACKEND_URL=http://backend:8000`. Name the Service `backend` and listen on 8000,
-> and the frontend needs no configuration at all. Name it anything else and you must
-> set `BACKEND_URL` to match.
-
----
-
-### Step 10 — Deploy the frontend, and get a public IP
-
-```yaml
-# k8s/frontend.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: frontend
-spec:
-  replicas: 1                 # stateless; this one could safely be scaled up
-  selector:
-    matchLabels: { app: frontend }
-  template:
-    metadata:
-      labels: { app: frontend }
-    spec:
-      containers:
-        - name: frontend
-          image: <ACR_LOGIN>/legallens-frontend:v1
-          ports:
-            - containerPort: 8080
-          readinessProbe:
-            httpGet: { path: /healthz, port: 8080 }
-          livenessProbe:
-            httpGet: { path: /healthz, port: 8080 }
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: frontend
-spec:
-  type: LoadBalancer          # this is what creates the public IP
-  selector: { app: frontend }
-  ports:
-    - port: 80
-      targetPort: 8080
-```
-
-```bash
-kubectl apply -f k8s/backend.yaml
-kubectl apply -f k8s/frontend.yaml
-
-kubectl get pods -w                      # wait for both to be Running and Ready
+kubectl get pods -w                      # both Running and Ready
 kubectl get service frontend -w          # EXTERNAL-IP is <pending> for a minute or two
 ```
 
-Then open `http://<EXTERNAL-IP>` in a browser.
+Then open `http://<EXTERNAL-IP>`.
 
 The frontend starts whether or not the backend is up — nginx resolves the upstream
-per request — so a frontend that loads with API errors means the backend pod, not the
+per request — so a UI that loads with API errors points at the backend pod, not the
 frontend.
 
 > **Shortcut:** `LoadBalancer` + a bare IP + plain HTTP. No DNS name, no certificate.
 > The real answer is an Ingress controller with cert-manager and a hostname, which is
-> a whole additional topic. Do not put real documents through this.
-
----
+> a topic of its own. Do not put real documents through this.
 
 ### Troubleshooting, in the order things usually break
 
@@ -433,31 +336,201 @@ kubectl exec -it deploy/backend -- sh
 
 ---
 
-## Part 3 — What CD will need later
+## Part 3 — Setting up CD
 
-Not built yet. Listed so the resources above do not have to be revisited.
+The pipeline exists: `.github/workflows/cd.yml`, with the manifests it applies in
+`k8s/`. It is not wired to your Azure yet, and it cannot be from inside the repo —
+the four steps below are the ones only you can do.
 
-- [ ] **A way for GitHub Actions to authenticate to Azure.** The modern answer is
-      **workload identity federation** — an app registration with a federated
-      credential trusting your GitHub repo, so there is no secret to rotate. The
-      older answer is a service principal with a client secret in
-      `AZURE_CREDENTIALS`. Prefer federation.
-- [ ] **Role assignments for that identity:** `AcrPush` on the registry, and
-      `Azure Kubernetes Service Cluster User Role` on the cluster.
-- [ ] **A GitHub environment** (e.g. `production`) if you want a manual approval gate
-      before deploys.
-- [ ] **Image tags from the git SHA**, not `latest`, so a deployment can be traced to
-      a commit and rolled back to one.
-- [ ] **The manifests in the repo** — the YAML above belongs in a `k8s/` directory,
-      with the image tag templated, so the pipeline applies version control rather
-      than something pasted into a terminal once.
-- [ ] **A trigger decision:** deploy on every merge to `main`, or only on a tag.
+### What it does
 
-The CI side is already done and the hook is in place: `.github/workflows/ci.yml`
-builds and boots the image on every PR, and its `push: [main]` trigger is the signal
-a deploy workflow reads. See `backend/CI.md`.
+```
+CI passes on main  ->  build-and-push            ->  deploy
+                       two images -> ACR,            kubectl apply -> AKS,
+                       tagged <git sha>              wait, smoke-test, roll back on failure
+```
 
----
+Three decisions worth knowing before you read the file:
+
+**It triggers on CI succeeding, not on a push to `main`.** A `push` trigger runs CD
+in parallel with the tests, so a commit can reach the cluster before anything has
+verified it. `workflow_run` waits for CI's verdict and reads it. The cost is one
+indirection; the benefit is that only green commits deploy.
+
+**Every image is tagged with the git SHA. Nothing is tagged `latest`.** A moving tag
+makes "what is running in the cluster?" unanswerable and makes rollback guesswork.
+With SHA tags, `kubectl describe pod` names the commit it came from.
+
+**The images are rebuilt in CD, not carried over from CI.** CI is deliberately
+secretless — it holds no registry credential and cannot push — and passing a built
+image between workflows means uploading and re-importing a tarball. A rebuild from
+the same SHA is deterministic and takes about a minute with the layer cache warm.
+
+### Step 1 — An identity GitHub can use, with no stored password
+
+Workload identity federation: Azure trusts a token GitHub mints for your repository,
+so there is no client secret to leak or rotate.
+
+**CLI** — set `GH_ORG` and `GH_REPO` to your own:
+
+```bash
+export GH_ORG=hanoknaidu
+export GH_REPO=legallens
+export APP_NAME=legallens-cd
+
+# The app registration and its service principal.
+APP_ID=$(az ad app create --display-name $APP_NAME --query appId --output tsv)
+az ad sp create --id $APP_ID
+echo "AZURE_CLIENT_ID = $APP_ID"
+```
+
+Now **two** federated credentials. Two, not one, and this is the step people get
+wrong: GitHub's token carries a different `subject` depending on the job. The build
+job runs against the branch; the deploy job declares `environment: production`, which
+changes the subject. One credential authenticates one of them and the other fails
+with a confusing `AADSTS700213`.
+
+```bash
+az ad app federated-credential create --id $APP_ID --parameters "{
+  \"name\": \"github-main\",
+  \"issuer\": \"https://token.actions.githubusercontent.com\",
+  \"subject\": \"repo:${GH_ORG}/${GH_REPO}:ref:refs/heads/main\",
+  \"audiences\": [\"api://AzureADTokenExchange\"]
+}"
+
+az ad app federated-credential create --id $APP_ID --parameters "{
+  \"name\": \"github-env-production\",
+  \"issuer\": \"https://token.actions.githubusercontent.com\",
+  \"subject\": \"repo:${GH_ORG}/${GH_REPO}:environment:production\",
+  \"audiences\": [\"api://AzureADTokenExchange\"]
+}"
+```
+
+**Portal**
+
+1. **Microsoft Entra ID → App registrations → + New registration**. Name it
+   `legallens-cd`, single tenant, no redirect URI. **Register**.
+2. Copy the **Application (client) ID** and **Directory (tenant) ID** from Overview.
+3. **Certificates & secrets → Federated credentials → + Add credential**.
+4. Scenario: **GitHub Actions deploying Azure resources**. Fill in your org and
+   repository. Entity type **Branch**, branch `main`. Name it `github-main`.
+5. **Add a second credential** the same way, but entity type **Environment**, with
+   environment name `production`.
+
+> Do **not** create a client secret. The whole point of federation is that there is
+> no secret to store.
+
+### Step 2 — Give that identity permission
+
+Two role assignments: push images, and reach the cluster.
+
+```bash
+SUB_ID=$(az account show --query id --output tsv)
+ACR_ID=$(az acr show --name $ACR_NAME --query id --output tsv)
+AKS_ID=$(az aks show --resource-group $RG --name $AKS_NAME --query id --output tsv)
+
+az role assignment create --assignee $APP_ID --role AcrPush --scope $ACR_ID
+az role assignment create --assignee $APP_ID \
+  --role "Azure Kubernetes Service Cluster User Role" --scope $AKS_ID
+
+echo "AZURE_SUBSCRIPTION_ID = $SUB_ID"
+```
+
+**Portal:** on the registry, and again on the cluster → **Access control (IAM) → +
+Add role assignment** → pick the role → **Members → select the `legallens-cd` app**
+→ Review + assign.
+
+> If the cluster was created with **Azure RBAC for Kubernetes** enabled, Cluster User
+> alone lets you fetch a kubeconfig but not apply anything. Add **Azure Kubernetes
+> Service RBAC Writer** on the cluster too. A cluster created exactly as Part 2
+> describes does not need it.
+
+### Step 3 — Tell GitHub about your Azure
+
+**Settings → Secrets and variables → Actions** in the repository.
+
+**Variables** tab (not secret — they appear in logs and that is fine):
+
+| Name | Value |
+|---|---|
+| `ACR_NAME` | your registry name, without `.azurecr.io` |
+| `AKS_NAME` | your cluster name |
+| `AZURE_RESOURCE_GROUP` | your resource group name |
+
+**Secrets** tab:
+
+| Name | Value |
+|---|---|
+| `AZURE_CLIENT_ID` | the app id from Step 1 |
+| `AZURE_TENANT_ID` | `az account show --query tenantId -o tsv` |
+| `AZURE_SUBSCRIPTION_ID` | `az account show --query id -o tsv` |
+| `ANTHROPIC_API_KEY` | **optional** — see below |
+
+**Leave `ANTHROPIC_API_KEY` out for the first deploy.** Without it the pipeline
+deploys the backend with `LEGAL_LENS_LLM_PROVIDER=echo`, a deterministic stub that
+makes no vendor call. The whole pipeline proves itself — build, push, rollout, smoke
+test — before a single token is spent. Add the secret later and the next deploy
+switches to the real provider on its own.
+
+**CLI**, if you prefer:
+
+```bash
+gh variable set ACR_NAME --body "$ACR_NAME"
+gh variable set AKS_NAME --body "$AKS_NAME"
+gh variable set AZURE_RESOURCE_GROUP --body "$RG"
+
+gh secret set AZURE_CLIENT_ID --body "$APP_ID"
+gh secret set AZURE_TENANT_ID --body "$(az account show --query tenantId -o tsv)"
+gh secret set AZURE_SUBSCRIPTION_ID --body "$(az account show --query id -o tsv)"
+```
+
+### Step 4 — The `production` environment
+
+**Settings → Environments → New environment**, named `production`. Creating it is
+enough; the deploy job references it, and an environment that does not exist is
+created implicitly but will not show deployment history.
+
+Leave it unprotected and deploys are automatic. If you later want a human to approve
+each one, add **Required reviewers** here — no change to the workflow.
+
+### Running it
+
+Merge to `main`. CI runs; when it goes green, CD starts on its own.
+
+To deploy without a merge — after rebuilding the cluster, say — **Actions → CD → Run
+workflow**.
+
+The run summary shows the commit, the provider in use, the public URL, and
+`kubectl get pods`. The URL also appears on the repository's **Environments** page.
+
+### What the pipeline checks, in increasing order of meaning
+
+1. `kubectl apply` succeeded — Kubernetes *accepted* the objects.
+2. `kubectl rollout status` — the new pods actually *started and became ready*. An
+   image that crash-loops is accepted by the API server and never gets here.
+3. `curl /healthz` and `/api/health` through the public IP — the app is *serving*,
+   and the frontend can reach the backend inside the cluster.
+
+If step 2 fails, the deployment that failed to settle is rolled back automatically
+and the job goes red.
+
+If step 3 fails, the rollout is **not** rolled back — the pods are up and healthy by
+Kubernetes' reckoning, so something else is wrong and reverting would hide it. The
+common cause is an invalid `ANTHROPIC_API_KEY`: `/api/health` then reports
+`degraded` rather than `ok`, and the smoke test insists on `ok`.
+
+### Why not Helm
+
+Because there are three manifests and one substituted value in each. A chart would
+add a templating language, a values file, and a release lifecycle in order to express
+`image: <this tag>` — concepts a reader of this repository would have to learn before
+they could see what gets deployed. `envsubst` is two lines of shell and the output is
+the YAML you already read.
+
+The calculation changes the moment there is more than one environment to
+differentiate — staging and production with different replica counts, hostnames and
+resource limits. At that point Helm or Kustomize overlays earn their keep. One
+cluster and one namespace do not.
 
 ## Part 4 — Tearing it all down
 

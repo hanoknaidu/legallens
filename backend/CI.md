@@ -309,7 +309,9 @@ Layers are cached via buildx's GitHub Actions cache backend
 the default docker driver cannot use it.
 
 The job **never pushes.** Publishing is CD's job and needs a registry credential
-this workflow deliberately does not hold.
+this workflow deliberately does not hold — keeping CI secretless is why
+`.github/workflows/cd.yml` rebuilds the images rather than receiving them from here.
+CD runs on this workflow succeeding on `main`; see [CD_readme.md](../CD_readme.md).
 
 ## The `retrieval` job
 
@@ -354,9 +356,6 @@ Node comes from `.nvmrc` at the repository root rather than a pin here.
 
 ## Not covered yet
 
-- **CD** — nothing here tags or pushes an image. The `docker` job builds and
-  boots one, then throws it away; the `push: [main]` trigger is the hook a deploy
-  workflow reads.
 - **Type checking** — no mypy or ty is configured in `pyproject.toml`, and
   adding one as a blocking gate to a codebase that has never been checked would
   behave like the formatting problem above.
