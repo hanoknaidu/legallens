@@ -106,6 +106,16 @@ jobs:
             exit 0
           fi
 
+          # A conflicted branch cannot be merged, and letting the attempt fail
+          # would report it as a broken pipeline rather than as a branch needing a
+          # rebase. UNKNOWN means GitHub is still computing it — worth trying.
+          mergeable=$(gh pr view "${number}" --repo "${REPO}" --json mergeable --jq .mergeable)
+          if [ "${mergeable}" = "CONFLICTING" ]; then
+            echo "PR #${number} has conflicts with main; rebase it."
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           echo "merge=true"        >> "$GITHUB_OUTPUT"
           echo "number=${number}"  >> "$GITHUB_OUTPUT"
 
@@ -121,8 +131,15 @@ jobs:
           # CD tags the images with.
           #
           # The branch is deliberately not deleted — this project reuses one.
+          # --match-head-commit closes the gap between CI finishing and this step
+          # running. Without it, a commit pushed in that window would be merged on
+          # the strength of a CI run that never saw it: the pull request is found by
+          # the tested SHA, but `gh pr merge` acts on whatever the head is *now*.
+          # With it, a head that has moved refuses the merge, and the CI run already
+          # under way for the new commit merges it a minute later instead.
           gh pr merge "${{ steps.pr.outputs.number }}" \
             --repo "${REPO}" \
+            --match-head-commit "${{ github.event.workflow_run.head_sha }}" \
             --squash \
             --subject "$(gh pr view "${{ steps.pr.outputs.number }}" --repo "${REPO}" --json title --jq .title) (#${{ steps.pr.outputs.number }})"
 

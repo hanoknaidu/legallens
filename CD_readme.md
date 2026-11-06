@@ -545,8 +545,17 @@ from a branch **in this repository**. The last one matters: auto-merging a fork'
 branch on green CI would mean anyone who can open a pull request can put code on
 `main` and into production by passing tests they wrote.
 
-It also looks the pull request up **by commit**, not by branch, so a branch that
-moved on while CI was running cannot sneak an untested commit through.
+It also looks the pull request up **by commit**, not by branch, and merges with
+`--match-head-commit`. Those are two halves of the same guard: the first finds the
+right pull request for the run that just passed, and the second refuses if the head
+has moved since. Without the second, a commit pushed between CI finishing and the
+merge running would land on the strength of a CI run that never saw it — `gh pr
+merge` acts on whatever the head is *now*. When that happens the merge is skipped
+and the CI run already under way for the new commit merges it a minute later.
+
+A pull request with conflicts is reported as needing a rebase rather than attempted
+and failed, so a red Auto-merge run means the pipeline is broken, not that a branch
+is behind.
 
 #### What it gives up
 
