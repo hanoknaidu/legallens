@@ -456,6 +456,7 @@ Add role assignment** → pick the role → **Members → select the `legallens-
 | `ACR_NAME` | your registry name, without `.azurecr.io` |
 | `AKS_NAME` | your cluster name |
 | `AZURE_RESOURCE_GROUP` | your resource group name |
+| `BACKEND_EXTRAS` | **optional** — leave unset. `orchestrator workflows` switches on the real retrieval stack; see [below](#switching-on-the-full-retrieval-stack) |
 
 **Secrets** tab:
 
@@ -518,6 +519,67 @@ If step 3 fails, the rollout is **not** rolled back — the pods are up and heal
 Kubernetes' reckoning, so something else is wrong and reverting would hide it. The
 common cause is an invalid `ANTHROPIC_API_KEY`: `/api/health` then reports
 `degraded` rather than `ok`, and the smoke test insists on `ok`.
+
+### Switching on the full retrieval stack
+
+The default deployment runs **real generation over weak retrieval**. The image is
+built with no extras, so embeddings are the `hashing` stand-in and the vector store
+is in-memory — not the `BAAI/bge-m3` stack the e2e run in
+[docs/e2e-test-report.md](docs/e2e-test-report.md) measured. Answers come back
+fluent; what suffers is *which pages get found*, which is the failure mode that
+looks like the model being bad.
+
+To run the real thing, set **one repository variable**:
+
+| Variable | Value |
+|---|---|
+| `BACKEND_EXTRAS` | `orchestrator workflows` |
+
+```bash
+gh variable set BACKEND_EXTRAS --body "orchestrator workflows"
+```
+
+Then **Actions → CD → Run workflow**. Everything else follows from it, because
+asking anyone to remember four coordinated changes is how a demo dies twenty minutes
+in with an OOMKill:
+
+| | Default | With the extras |
+|---|---|---|
+| Image size | 195 MB | **6.42 GB** |
+| Provider | `anthropic` | `orchestrator` |
+| Memory request / limit | 512Mi / 2Gi | **3Gi / 8Gi** |
+| CPU request | 250m | 500m |
+| Data volume | 8Gi | **32Gi** |
+
+`HF_HOME` already points at `/data/hf` in both, so the ~4.5GB of model weights land
+on the volume and download **once per volume** rather than once per pod. A pod
+filesystem is ephemeral; without that, every restart re-downloads them.
+
+**What to expect on the first run of it.** The build takes minutes rather than
+seconds. The node then pulls 6.42GB before the container starts, which is why the
+Deployment allows a 30-minute progress deadline and the pipeline waits 20 minutes
+for the rollout. The first *question* asked of the app downloads the weights, so it
+is slow in a way later ones are not.
+
+**Check the node can take it.** A `Standard_D4s` has 4 vCPU and 16GB, so a 3Gi
+request schedules comfortably. On a 2-vCPU/4GB B-series node it will not — the pod
+sits `Pending` with `Insufficient memory`.
+
+**Going back** is the same variable, emptied:
+
+```bash
+gh variable set BACKEND_EXTRAS --body ""
+```
+
+The next deploy builds the small image again and asks for less memory. The disk does
+**not** shrink — Azure disks expand but never contract — so you keep paying for 32Gi
+until the resource group is deleted.
+
+> **Is it worth it for a class?** Probably not. The default stack demonstrates the
+> product end to end and deploys in a couple of minutes. The full stack is the right
+> call when the thing being shown is *retrieval quality* specifically, and it is
+> worth doing once so students see what the 6.42GB is actually made of — 4.1GB of it
+> is CUDA code a CPU node will never execute (`backend/DOCKER.md`).
 
 ### Why not Helm
 

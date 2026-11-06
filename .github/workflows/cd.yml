@@ -119,15 +119,23 @@ jobs:
       # linux/amd64 explicitly, even though the runner is already x86. It is the
       # platform AKS nodes run, and stating it means a future move to arm runners
       # cannot silently start producing images the cluster cannot execute.
+      # `EXTRAS` selects the dependency set baked into the image: empty is the
+      # default stack, "orchestrator workflows" adds torch and the real retrieval
+      # models and takes the image from 195MB to 6.42GB (backend/DOCKER.md). The
+      # build is correspondingly slower — minutes, not seconds — which is why the
+      # cache scope below is keyed on it: switching stacks must not serve a cached
+      # layer built for the other one.
       - name: Build and push the backend
         uses: docker/build-push-action@v7
         with:
           context: ./backend
           platforms: linux/amd64
+          build-args: |
+            EXTRAS=${{ vars.BACKEND_EXTRAS }}
           push: true
           tags: ${{ vars.ACR_NAME }}.azurecr.io/${{ env.BACKEND_REPOSITORY }}:${{ needs.resolve.outputs.sha }}
-          cache-from: type=gha,scope=backend
-          cache-to: type=gha,mode=max,scope=backend
+          cache-from: type=gha,scope=backend-${{ vars.BACKEND_EXTRAS || 'default' }}
+          cache-to: type=gha,mode=max,scope=backend-${{ vars.BACKEND_EXTRAS || 'default' }}
 
       - name: Build and push the frontend
         uses: docker/build-push-action@v7
@@ -191,20 +199,64 @@ jobs:
       # If the repository has no ANTHROPIC_API_KEY, this is skipped and the backend
       # is deployed with the echo provider: a deterministic stub that makes no vendor
       # call. That is what lets the whole pipeline be proven without a key or spend.
+      # Everything the retrieval stack changes, derived in one place from one
+      # variable. The alternative — asking an operator to remember to raise the
+      # memory limit and the disk when they change the extras — is four coordinated
+      # edits, and the failure when one is missed is an OOMKill twenty minutes into
+      # a demo.
+      - name: Work out the deployment shape
+        id: shape
+        env:
+          EXTRAS: ${{ vars.BACKEND_EXTRAS }}
+          HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          if echo "${EXTRAS}" | grep -q "workflows"; then
+            # bge-m3 plus the cross-encoder reranker are ~2.5GB resident before the
+            # application's own use, and HF_HOME lives on the volume.
+            {
+              echo "stack=full retrieval (orchestrator)"
+              echo "memory_request=3Gi"
+              echo "memory_limit=8Gi"
+              echo "cpu_request=500m"
+              echo "volume_size=32Gi"
+            } >> "$GITHUB_OUTPUT"
+            heavy=true
+          else
+            {
+              echo "stack=default (hashing embeddings, in-memory store)"
+              echo "memory_request=512Mi"
+              echo "memory_limit=2Gi"
+              echo "cpu_request=250m"
+              echo "volume_size=8Gi"
+            } >> "$GITHUB_OUTPUT"
+            heavy=false
+          fi
+
+          # The provider follows from the two inputs: no key means the echo stub
+          # whatever is installed, and the orchestrator provider needs the extras
+          # that are only present in the heavy image.
+          if [ "${HAS_KEY}" != "true" ]; then
+            provider=echo
+          elif [ "${heavy}" = "true" ]; then
+            provider=orchestrator
+          else
+            provider=anthropic
+          fi
+          echo "provider=${provider}" >> "$GITHUB_OUTPUT"
+          echo "Deploying the ${provider} provider." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Apply the API key secret
         id: secret
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           if [ -z "${ANTHROPIC_API_KEY}" ]; then
-            echo "No ANTHROPIC_API_KEY secret — deploying with the echo provider."
-            echo "provider=echo" >> "$GITHUB_OUTPUT"
+            echo "No ANTHROPIC_API_KEY secret — the echo provider needs none."
             exit 0
           fi
           kubectl create secret generic legallens-secrets \
             --from-literal=ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}" \
             --dry-run=client -o yaml | kubectl apply -f -
-          echo "provider=anthropic" >> "$GITHUB_OUTPUT"
 
       # envsubst rather than Helm or Kustomize. There are three manifests and one
       # substituted value in each; a chart would add a templating language, a values
@@ -218,12 +270,17 @@ jobs:
         env:
           BACKEND_IMAGE: ${{ vars.ACR_NAME }}.azurecr.io/${{ env.BACKEND_REPOSITORY }}:${{ needs.resolve.outputs.sha }}
           FRONTEND_IMAGE: ${{ vars.ACR_NAME }}.azurecr.io/${{ env.FRONTEND_REPOSITORY }}:${{ needs.resolve.outputs.sha }}
-          LLM_PROVIDER: ${{ steps.secret.outputs.provider }}
+          LLM_PROVIDER: ${{ steps.shape.outputs.provider }}
+          DATA_VOLUME_SIZE: ${{ steps.shape.outputs.volume_size }}
+          BACKEND_MEMORY_REQUEST: ${{ steps.shape.outputs.memory_request }}
+          BACKEND_MEMORY_LIMIT: ${{ steps.shape.outputs.memory_limit }}
+          BACKEND_CPU_REQUEST: ${{ steps.shape.outputs.cpu_request }}
         run: |
-          kubectl apply -f k8s/pvc.yaml
-          for manifest in k8s/backend.yaml k8s/frontend.yaml; do
-            envsubst '${BACKEND_IMAGE} ${FRONTEND_IMAGE} ${LLM_PROVIDER}' \
-              < "${manifest}" | tee "/tmp/$(basename "${manifest}")" | kubectl apply -f -
+          names='${BACKEND_IMAGE} ${FRONTEND_IMAGE} ${LLM_PROVIDER} ${DATA_VOLUME_SIZE}'
+          names="${names} "'${BACKEND_MEMORY_REQUEST} ${BACKEND_MEMORY_LIMIT} ${BACKEND_CPU_REQUEST}'
+          for manifest in k8s/pvc.yaml k8s/backend.yaml k8s/frontend.yaml; do
+            envsubst "${names}" < "${manifest}" \
+              | tee "/tmp/$(basename "${manifest}")" | kubectl apply -f -
           done
 
       # The apply above only says Kubernetes accepted the objects. Whether the new
@@ -233,7 +290,10 @@ jobs:
       - name: Wait for the rollout
         id: rollout
         run: |
-          kubectl rollout status deployment/backend  --timeout=5m
+          # 20 minutes, not 5: the full retrieval image is 6.42GB and the node has
+          # to pull it before the container starts. Returns as soon as the rollout
+          # settles, so this costs nothing on the small image.
+          kubectl rollout status deployment/backend  --timeout=20m
           kubectl rollout status deployment/frontend --timeout=5m
 
       # Only on a failed rollout, and only for the deployment that failed to settle.
@@ -300,7 +360,8 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Commit | \`${{ needs.resolve.outputs.short }}\` |"
-            echo "| Provider | ${{ steps.secret.outputs.provider }} |"
+            echo "| Stack | ${{ steps.shape.outputs.stack }} |"
+            echo "| Provider | ${{ steps.shape.outputs.provider }} |"
             echo "| URL | ${{ steps.address.outputs.url || 'not assigned' }} |"
             echo
             echo '```'

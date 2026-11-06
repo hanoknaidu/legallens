@@ -15,4 +15,11 @@ spec:
   storageClassName: managed-csi
   resources:
     requests:
-      storage: 8Gi
+      # Set by the pipeline from BACKEND_EXTRAS: 8Gi for the default stack, 32Gi
+      # when the retrieval models are in play — they are ~4.5GB in HF_HOME, which
+      # lives here so they download once per volume rather than once per pod.
+      #
+      # A disk can be expanded but never shrunk. Going from 8Gi to 32Gi when you
+      # switch stacks is an expansion and is allowed; switching back leaves the
+      # larger disk in place.
+      storage: ${DATA_VOLUME_SIZE}

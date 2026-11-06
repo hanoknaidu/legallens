@@ -17,6 +17,10 @@ spec:
   # Recreate accepts a few seconds of downtime instead of hanging.
   strategy:
     type: Recreate
+  # Default is 600s, which is not enough for the full retrieval stack: that image
+  # is 6.42GB and the node has to pull it before the container starts at all.
+  # Generous here costs nothing when the image is already cached.
+  progressDeadlineSeconds: 1800
   selector:
     matchLabels:
       app: backend
@@ -41,8 +45,15 @@ spec:
             - name: LEGAL_LENS_ENVIRONMENT
               value: "prod"
             - name: LEGAL_LENS_LLM_PROVIDER
-              # `echo` unless the pipeline found an ANTHROPIC_API_KEY to deploy.
+              # Chosen by the pipeline: `echo` with no API key, `orchestrator` when
+              # the retrieval extras are built in, `anthropic` otherwise.
               value: "${LLM_PROVIDER}"
+            - name: HF_HOME
+              # On the volume, not in the container filesystem. A pod's filesystem is
+              # ephemeral, so without this the ~4.5GB of model weights download again
+              # on every restart (backend/DOCKER.md). Harmless when the models are not
+              # in use: nothing writes here.
+              value: "/data/hf"
           envFrom:
             # Holds ANTHROPIC_API_KEY. Created and kept current by the pipeline;
             # `optional: true` so a cluster without it still starts, which is what
@@ -53,30 +64,41 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+          # A startup probe rather than a long initialDelaySeconds on the other two.
+          # It is the difference between "slow to start" and "broken": until this
+          # passes, the liveness probe is suspended, so a first boot that loads an
+          # embedder and a reranker cannot be killed halfway through for failing a
+          # check it was never going to answer yet. 60 x 10s = up to 10 minutes.
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
           readinessProbe:
             # /api/health answers 200 for both "ok" and "degraded" — a missing vendor
             # key degrades the service without stopping it serving.
             httpGet:
               path: /api/health
               port: http
-            initialDelaySeconds: 10
             periodSeconds: 10
             failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /api/health
               port: http
-            # Matches the image's own HEALTHCHECK start-period: the orchestrator
-            # loads its index at boot, which is not instant.
-            initialDelaySeconds: 40
             periodSeconds: 30
             failureThreshold: 3
           resources:
             requests:
-              cpu: 250m
-              memory: 512Mi
+              # What the scheduler reserves. Raised with the retrieval stack because
+              # bge-m3 and the reranker are ~2.5GB resident before the app's own use.
+              cpu: ${BACKEND_CPU_REQUEST}
+              memory: ${BACKEND_MEMORY_REQUEST}
             limits:
-              memory: 2Gi
+              # Memory only, deliberately. A CPU limit throttles rather than fails,
+              # and on CPU-only inference that turns a slow answer into a stuck one.
+              memory: ${BACKEND_MEMORY_LIMIT}
       # Above the image's GRACEFUL_TIMEOUT of 30s, so Kubernetes does not SIGKILL
       # uvicorn while it is still draining an in-flight SSE chat stream.
       terminationGracePeriodSeconds: 45
