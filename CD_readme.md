@@ -345,14 +345,13 @@ the four steps below are the ones only you can do.
 ### What it does
 
 ```
-PR opened  ->  CI  ->  auto-merge      ->  CD ------------------------------+
-                       squash to main      build-and-push    deploy        |
-                       dispatch CD         images -> ACR,    apply -> AKS, |
-                                           tagged <git sha>  smoke-test ---+
+CI passes on main  ->  build-and-push            ->  deploy
+                       two images -> ACR,            kubectl apply -> AKS,
+                       tagged <git sha>              wait, smoke-test, roll back on failure
 ```
 
-Three workflows. `ci.yml` is the gate, `auto-merge.yml` lands what passes it, and
-`cd.yml` ships what landed. Opening the pull request is the only manual step.
+Two workflows. `ci.yml` is the gate; `cd.yml` ships what gets past it and onto
+`main`. Merging is a person's job.
 
 Three decisions worth knowing before you read the file:
 
@@ -500,89 +499,17 @@ each one, add **Required reviewers** here — no change to the workflow.
 
 ### Running it
 
-Push a branch and open a pull request against `main`. CI runs; when it passes,
-`auto-merge.yml` squashes the pull request into `main` and starts CD. Nothing else
-is needed.
+Merge a pull request into `main`. CI runs on `main`; when it goes green, CD starts
+on its own.
+
+That chain works because a merge you perform is attributed to **you**. A merge
+performed by a workflow would not be: GitHub does not raise events for pushes made
+with the `GITHUB_TOKEN`, so CI would never run on `main` and CD would never see a
+success to react to. Worth knowing if automatic merging is ever added — it has to
+dispatch CD explicitly rather than rely on this trigger.
 
 To deploy without a merge — after rebuilding the cluster, say — **Actions → CD → Run
 workflow**.
-
-#### One repository setting this depends on
-
-**Settings → Actions → General → Workflow permissions → Read and write
-permissions.**
-
-The default on many repositories is read-only, and with it the merge step fails with
-`403 Resource not accessible by integration`. Nothing else in the pipeline needs
-write access; auto-merge does, because merging is a write to the branch.
-
-#### Why auto-merge starts CD itself, rather than letting CD's trigger fire
-
-CD normally starts when CI succeeds on `main`. After an automatic merge it will not,
-and the reason is a documented GitHub rule:
-
-> events triggered by the `GITHUB_TOKEN` will not create a new workflow run
-> — [docs.github.com](https://docs.github.com/en/actions/concepts/security/github_token)
-
-The merge is performed with `GITHUB_TOKEN`, so the push to `main` raises no event,
-CI never runs on `main`, and CD's `workflow_run` trigger sees nothing. The same page
-names the exception the workflow relies on: *"`workflow_dispatch` and
-`repository_dispatch` events always create workflow runs."* So auto-merge dispatches
-CD explicitly.
-
-Two consequences, neither hidden:
-
-- **`main` carries no CI run of its own after an automatic merge.** The content was
-  tested as the pull request's merge result — a squash produces the same tree, only
-  a different SHA — and the daily scheduled run covers `main` from then on.
-- **"Only deploy what CI passed" still holds**, but it is enforced by auto-merge
-  refusing to merge anything else, rather than by CD's trigger.
-
-#### What auto-merge refuses
-
-It merges only a pull request that is open, not a draft, targets `main`, and comes
-from a branch **in this repository**. The last one matters: auto-merging a fork's
-branch on green CI would mean anyone who can open a pull request can put code on
-`main` and into production by passing tests they wrote.
-
-It also looks the pull request up **by commit**, not by branch, and merges with
-`--match-head-commit`. Those are two halves of the same guard: the first finds the
-right pull request for the run that just passed, and the second refuses if the head
-has moved since. Without the second, a commit pushed between CI finishing and the
-merge running would land on the strength of a CI run that never saw it — `gh pr
-merge` acts on whatever the head is *now*. When that happens the merge is skipped
-and the CI run already under way for the new commit merges it a minute later.
-
-A pull request with conflicts is reported as needing a rebase rather than attempted
-and failed, so a red Auto-merge run means the pipeline is broken, not that a branch
-is behind.
-
-#### What it gives up
-
-Code review. Anything that passes CI reaches `main` and then production with no
-human in between. That is what was asked for and it is reasonable for a
-single-maintainer teaching project — it is not a default to carry into a team
-repository. To put a person back in the loop, delete `auto-merge.yml` and merge
-pull requests by hand; nothing else depends on it.
-
-The run summary shows the commit, the provider in use, the public URL, and
-`kubectl get pods`. The URL also appears on the repository's **Environments** page.
-
-### What the pipeline checks, in increasing order of meaning
-
-1. `kubectl apply` succeeded — Kubernetes *accepted* the objects.
-2. `kubectl rollout status` — the new pods actually *started and became ready*. An
-   image that crash-loops is accepted by the API server and never gets here.
-3. `curl /healthz` and `/api/health` through the public IP — the app is *serving*,
-   and the frontend can reach the backend inside the cluster.
-
-If step 2 fails, the deployment that failed to settle is rolled back automatically
-and the job goes red.
-
-If step 3 fails, the rollout is **not** rolled back — the pods are up and healthy by
-Kubernetes' reckoning, so something else is wrong and reverting would hide it. The
-common cause is an invalid `ANTHROPIC_API_KEY`: `/api/health` then reports
-`degraded` rather than `ok`, and the smoke test insists on `ok`.
 
 ### Switching on the full retrieval stack
 
