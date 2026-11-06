@@ -1,0 +1,126 @@
+# The API. Deployed by .github/workflows/cd.yml, which substitutes ${BACKEND_IMAGE}
+# and ${LLM_PROVIDER} with envsubst before applying — so the image tag in the cluster
+# is always a git SHA that can be traced back to a commit.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  labels:
+    app: backend
+    app.kubernetes.io/part-of: legal-lens
+spec:
+  # Must stay 1. The backend is single-writer by design: SQLite takes one writer,
+  # the pending-turn registry lives in memory, and the image pins WORKERS=1.
+  replicas: 1
+  # Not RollingUpdate. The new pod cannot attach a ReadWriteOnce disk the old pod
+  # still holds, so a rolling update deadlocks until the old pod is evicted.
+  # Recreate accepts a few seconds of downtime instead of hanging.
+  strategy:
+    type: Recreate
+  # Default is 600s, which is not enough for the full retrieval stack: that image
+  # is 6.42GB and the node has to pull it before the container starts at all.
+  # Generous here costs nothing when the image is already cached.
+  progressDeadlineSeconds: 1800
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      securityContext:
+        # The image runs as uid 10001. Without fsGroup the mounted Azure Disk is
+        # root-owned, /data is not writable, and the failure surfaces as a confusing
+        # runtime error rather than as a mount failure.
+        fsGroup: 10001
+      containers:
+        - name: backend
+          image: ${BACKEND_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: LEGAL_LENS_ENVIRONMENT
+              value: "prod"
+            - name: LEGAL_LENS_LLM_PROVIDER
+              # Chosen by the pipeline: `echo` with no API key, `orchestrator` when
+              # the retrieval extras are built in, `anthropic` otherwise.
+              value: "${LLM_PROVIDER}"
+            - name: HF_HOME
+              # On the volume, not in the container filesystem. A pod's filesystem is
+              # ephemeral, so without this the ~4.5GB of model weights download again
+              # on every restart (backend/DOCKER.md). Harmless when the models are not
+              # in use: nothing writes here.
+              value: "/data/hf"
+          envFrom:
+            # Holds ANTHROPIC_API_KEY. Created and kept current by the pipeline;
+            # `optional: true` so a cluster without it still starts, which is what
+            # makes the echo-provider path work with no secret at all.
+            - secretRef:
+                name: legallens-secrets
+                optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # A startup probe rather than a long initialDelaySeconds on the other two.
+          # It is the difference between "slow to start" and "broken": until this
+          # passes, the liveness probe is suspended, so a first boot that loads an
+          # embedder and a reranker cannot be killed halfway through for failing a
+          # check it was never going to answer yet. 60 x 10s = up to 10 minutes.
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            # /api/health answers 200 for both "ok" and "degraded" — a missing vendor
+            # key degrades the service without stopping it serving.
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              # What the scheduler reserves. Raised with the retrieval stack because
+              # bge-m3 and the reranker are ~2.5GB resident before the app's own use.
+              cpu: ${BACKEND_CPU_REQUEST}
+              memory: ${BACKEND_MEMORY_REQUEST}
+            limits:
+              # Memory only, deliberately. A CPU limit throttles rather than fails,
+              # and on CPU-only inference that turns a slow answer into a stuck one.
+              memory: ${BACKEND_MEMORY_LIMIT}
+      # Above the image's GRACEFUL_TIMEOUT of 30s, so Kubernetes does not SIGKILL
+      # uvicorn while it is still draining an in-flight SSE chat stream.
+      terminationGracePeriodSeconds: 45
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: legallens-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  labels:
+    app: backend
+    app.kubernetes.io/part-of: legal-lens
+spec:
+  # Internal only. The browser never reaches this; the frontend's nginx proxies
+  # /api to it over the cluster network, which is what keeps the app same-origin.
+  type: ClusterIP
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

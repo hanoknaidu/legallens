@@ -1,0 +1,25 @@
+# The backend's /data: SQLite, uploaded originals, and the live vector index.
+#
+# ReadWriteOnce is the right access mode here rather than a limitation to work
+# around — one disk, one pod, which is exactly what a single-writer SQLite app
+# wants. It is also why the backend Deployment uses `Recreate`: a second pod
+# cannot attach this disk while the first still holds it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: legallens-data
+  labels:
+    app.kubernetes.io/part-of: legal-lens
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: managed-csi
+  resources:
+    requests:
+      # Set by the pipeline from BACKEND_EXTRAS: 8Gi for the default stack, 32Gi
+      # when the retrieval models are in play — they are ~4.5GB in HF_HOME, which
+      # lives here so they download once per volume rather than once per pod.
+      #
+      # A disk can be expanded but never shrunk. Going from 8Gi to 32Gi when you
+      # switch stacks is an expansion and is allowed; switching back leaves the
+      # larger disk in place.
+      storage: ${DATA_VOLUME_SIZE}
