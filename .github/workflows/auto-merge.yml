@@ -1,0 +1,155 @@
+# =============================================================================
+# Legal Lens — auto-merge
+# =============================================================================
+# Closes the loop: CI passes on a pull request -> the PR is merged to `main` ->
+# CD is started.
+#
+#     PR opened  ->  CI  ->  auto-merge  ->  CD
+#                            (this file)     (dispatched, see below)
+#
+# ## Why this dispatches CD instead of letting CD's own trigger fire
+#
+# CD normally starts when CI succeeds on `main`. That will not happen here, and
+# the reason is a documented GitHub rule rather than a quirk worth working around:
+#
+#   "events triggered by the GITHUB_TOKEN will not create a new workflow run"
+#   — docs.github.com/actions/concepts/security/github_token
+#
+# The merge below is performed with GITHUB_TOKEN, so the resulting push to `main`
+# raises no `push` event, CI never runs on `main`, and CD's `workflow_run` trigger
+# never sees a success to react to. The same page names the exception this file
+# relies on:
+#
+#   "workflow_dispatch and repository_dispatch events always create workflow runs"
+#
+# So CD is dispatched explicitly. The guarantee "only deploy what CI passed" is
+# unchanged — it is enforced here, by refusing to merge anything else, rather than
+# by CD's trigger.
+#
+# A consequence worth knowing: `main` carries no CI run of its own after a merge
+# by this workflow. The commit's content was tested as the pull request's merge
+# result, and the daily scheduled CI run on `main` covers it from then on.
+#
+# ## What this gives up
+#
+# Code review. Anything that passes CI reaches `main` and then production with no
+# human in between. That is the point of the file, and it is a deliberate trade
+# for a single-maintainer project — not a default to carry into a team repository.
+# To put a person back in the loop, delete this file and merge pull requests by
+# hand; nothing else depends on it.
+# =============================================================================
+
+name: Auto-merge
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  # Merging is a write to the branch.
+  contents: write
+  # Reading and merging the pull request itself.
+  pull-requests: write
+  # Dispatching CD.
+  actions: write
+
+concurrency:
+  # Serialised. Two PRs going green together must not race to merge: the second
+  # would be merging against a `main` it has not been tested with.
+  group: auto-merge
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Merge and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only a CI run that (a) passed and (b) came from a pull request. A CI run on
+    # `main` itself, or the daily scheduled one, has nothing to merge.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    steps:
+      - name: Find the pull request this run tested
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          # By commit rather than by branch: a branch can have moved on since CI
+          # started, and merging a commit that was never tested is the one thing
+          # this workflow must not do.
+          pr="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" \
+                  --jq '[.[] | select(.state == "open")][0] // empty')"
+
+          if [ -z "${pr}" ]; then
+            echo "No open pull request for ${HEAD_SHA}; nothing to merge."
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          number=$(echo "${pr}" | jq -r '.number')
+          base=$(echo    "${pr}" | jq -r '.base.ref')
+          draft=$(echo   "${pr}" | jq -r '.draft')
+          # A fork's branch is not ours. Auto-merging one would mean anybody who
+          # can open a pull request can put code on `main` by passing CI, which is
+          # a supply-chain hole rather than a convenience.
+          same_repo=$(echo "${pr}" | jq -r --arg r "${REPO}" '.head.repo.full_name == $r')
+
+          echo "PR #${number} -> ${base} (draft=${draft}, same-repo=${same_repo})"
+
+          if [ "${base}" != "main" ] || [ "${draft}" != "false" ] || [ "${same_repo}" != "true" ]; then
+            echo "Not eligible for auto-merge."
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "merge=true"        >> "$GITHUB_OUTPUT"
+          echo "number=${number}"  >> "$GITHUB_OUTPUT"
+
+      - name: Merge it
+        if: steps.pr.outputs.merge == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Squash: one commit on `main` per pull request, so the history reads as
+          # a list of changes rather than of keystrokes. The tree is identical to
+          # the merge result CI tested; only the SHA differs, and that SHA is what
+          # CD tags the images with.
+          #
+          # The branch is deliberately not deleted — this project reuses one.
+          gh pr merge "${{ steps.pr.outputs.number }}" \
+            --repo "${REPO}" \
+            --squash \
+            --subject "$(gh pr view "${{ steps.pr.outputs.number }}" --repo "${REPO}" --json title --jq .title) (#${{ steps.pr.outputs.number }})"
+
+      - name: Start CD
+        if: steps.pr.outputs.merge == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # The push above raised no event, so nothing else will start CD. See the
+          # header: workflow_dispatch always creates a run, even from GITHUB_TOKEN.
+          #
+          # No ref argument beyond `main`: CD's own `resolve` job reads the branch
+          # tip, which is the commit just merged.
+          gh workflow run cd.yml --repo "${REPO}" --ref main
+          echo "Dispatched CD against main."
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            if [ "${{ steps.pr.outputs.merge }}" = "true" ]; then
+              echo "### Merged #${{ steps.pr.outputs.number }} and started CD"
+            else
+              echo "### Nothing to merge"
+              echo
+              echo "CI passed, but no open same-repo pull request onto \`main\` was"
+              echo "found for \`${{ github.event.workflow_run.head_sha }}\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
