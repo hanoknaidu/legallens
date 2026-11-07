@@ -77,17 +77,23 @@ across all of Azure and lowercase alphanumeric only** — no hyphens. Put your i
 or a number in it.
 
 ```bash
-export RG=legallens-rg
+export RG=rg-legalens
 export LOCATION=eastus
-export ACR_NAME=legallensacr001        # <-- change this, must be globally unique
-export AKS_NAME=legallens-aks
+export ACR_NAME=legallensacr1          # globally unique; already taken by this project
+export AKS_NAME=aks-legallens
 ```
+
+Those are the names **this project actually uses** — the resources already exist, so
+the values above are what the later steps and the pipeline's repository variables are
+set to. Two places where the live setup differs from the walkthrough below, neither
+of which matters to the deploy: the registry is **Standard** rather than Basic, and
+the node pool runs **2 nodes** rather than 1.
 
 | # | Resource | Why it is needed | Roughly what it costs |
 |---|---|---|---|
 | 1 | Resource group | A folder for everything else. Deleting it deletes the lot — which is how you avoid a surprise bill. | Free |
-| 2 | Container registry (ACR) | AKS pulls images from a registry; it cannot use your laptop's Docker. | Basic ≈ $5/month |
-| 3 | AKS cluster | Runs the containers. | Control plane free on the Free tier; **you pay for the node VM** |
+| 2 | Container registry (ACR) | AKS pulls images from a registry; it cannot use your laptop's Docker. | Basic ≈ $5/month; **Standard** (what is deployed) ≈ $20/month |
+| 3 | AKS cluster | Runs the containers. | Control plane free on the Free tier; **you pay for the node VMs** — `Standard_D2s_v4` ≈ $0.096/hour each, and the pool runs 2 |
 | 4 | ACR ↔ AKS role assignment | Lets the cluster pull from your registry without a password. | Free |
 | 5 | Kubernetes Secret | Holds `ANTHROPIC_API_KEY`. | Free (in-cluster) |
 | 6 | PersistentVolumeClaim → Azure Disk | The backend's `/data`. Provisioned automatically by the PVC. | Small managed disk, a few $/month |
@@ -140,7 +146,20 @@ az acr show --name $ACR_NAME --query loginServer --output tsv    # <name>.azurec
 
 ### Step 3 — AKS cluster
 
-The one that takes a few minutes. `--node-count 1` and a small VM keep it cheap.
+The one that takes a few minutes. `--node-count 1` keeps it to a single node.
+`Standard_D2s_v4` — the Dsv4-series 2-vCPU size, 2 vCPU and 8GB — is comfortable for
+the default stack and roughly $0.096/hour, about $70/month if you leave it running,
+which is why [Part 4](#part-4--tearing-it-all-down) matters. It is **tight** for the
+full retrieval stack: the 3Gi request fits, the 8Gi limit does not — see
+[below](#switching-on-the-full-retrieval-stack).
+
+`--kubernetes-version` pins the control plane. Omit it and you get whatever the
+region's default is that week, which makes "it worked last month" hard to reason
+about. Check what your region actually offers before you copy the value below:
+
+```bash
+az aks get-versions --location $LOCATION --output table
+```
 
 **CLI**
 
@@ -149,7 +168,8 @@ az aks create \
   --resource-group $RG \
   --name $AKS_NAME \
   --node-count 1 \
-  --node-vm-size Standard_D4s \
+  --node-vm-size Standard_D2s_v4 \
+  --kubernetes-version 1.36.5 \
   --tier free \
   --generate-ssh-keys \
   --attach-acr $ACR_NAME
@@ -162,10 +182,23 @@ Step 4 separately, or ask whoever owns the subscription to run it.
 **Portal**
 
 1. Search **Kubernetes services** → **+ Create** → **Create a Kubernetes cluster**.
-2. Basics: resource group, cluster name, region, **Free** pricing tier.
-3. Node pools: edit the default pool → node count **1**, size **B2s**.
+2. Basics: resource group, cluster name, region, **Free** pricing tier, and
+   **Kubernetes version** `1.36.5`.
+3. Node pools: one pool is all you need. Edit the default pool → node count **1**,
+   size **D2s v4** (`Standard_D2s_v4`, under the **Dsv4-series** family). Leave
+   **node auto-provisioning** disabled — nothing here needs the cluster to invent
+   node pools, and a disabled autoscaler is one less thing that can surprise the
+   bill.
 4. Integrations tab: pick your registry under **Container registry**.
 5. **Review + create** → **Create**. It takes 5–10 minutes.
+
+Confirm what you got:
+
+```bash
+kubectl version                             # server should report v1.36.5
+kubectl get nodes -o wide                   # one node
+kubectl get node -o jsonpath='{.items[0].metadata.labels.node\.kubernetes\.io/instance-type}{"\n"}'
+```
 
 > **Shortcut:** one node, no availability zones, no autoscaling, public API server.
 > A real cluster would have at least three nodes across zones and a private API
@@ -369,6 +402,23 @@ secretless — it holds no registry credential and cannot push — and passing a
 image between workflows means uploading and re-importing a tarball. A rebuild from
 the same SHA is deterministic and takes about a minute with the layer cache warm.
 
+### Where this project stands today
+
+Verified against the live subscription and repository on 2026-11-06:
+
+| | |
+|---|---|
+| Images tagged with the git SHA, never `latest` | **Yes** — `cd.yml` tags both images `:${{ needs.resolve.outputs.sha }}`, and `latest` appears nowhere in the workflows or the manifests |
+| Deploy runs automatically once CI passes on `main` | **Yes** — `workflow_run` on CI, gated on `conclusion == 'success'`; CD has fired on its own after the last two green CI runs on `main` |
+| App registration `legallens-cd` with both federated credentials | **Yes** — `github-main` (branch) and `github-env-production` (environment) |
+| Repository variables and secrets | **Yes** — `ACR_NAME`, `AKS_NAME`, `AZURE_RESOURCE_GROUP`; `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` |
+| `production` environment | **Yes**, unprotected — deploys need no approval |
+| Role assignments on ACR and AKS (Step 2 below) | **No** — the identity has none, and nothing has been pushed to the registry yet |
+| ACR ↔ AKS pull permission ([Step 4](#step-4--let-aks-pull-from-acr)) | **No** — the kubelet identity has no `AcrPull`, so pods would `ImagePullBackOff` even once images exist |
+
+So the pipeline is wired and the chain fires; what is missing is purely the three
+role assignments. Until they exist, CD fails in `build-and-push` at `az acr login`.
+
 ### Step 1 — An identity GitHub can use, with no stored password
 
 Workload identity federation: Azure trusts a token GitHub mints for your repository,
@@ -552,9 +602,29 @@ Deployment allows a 30-minute progress deadline and the pipeline waits 20 minute
 for the rollout. The first *question* asked of the app downloads the weights, so it
 is slow in a way later ones are not.
 
-**Check the node can take it.** A `Standard_D4s` has 4 vCPU and 16GB, so a 3Gi
-request schedules comfortably. On a 2-vCPU/4GB B-series node it will not — the pod
-sits `Pending` with `Insufficient memory`.
+**Check the node can take it — on `Standard_D2s_v4`, only just.** That size is 2 vCPU
+and 8GB, of which AKS reserves roughly 1.5GB for the system, leaving about 5.5GB
+allocatable. So:
+
+- The **3Gi request schedules.** The pod will not sit `Pending`.
+- The **8Gi limit cannot be honoured.** It is above the node's total RAM, so the
+  ceiling that actually applies is the node running out of memory — the pod gets
+  OOMKilled and restarts rather than being throttled at a limit. With ~2.5GB resident
+  in model weights there is headroom for normal use, but a large document or two
+  concurrent questions can cross it.
+- The **500m CPU request** leaves half the box for everything else. CPU-only
+  inference on 2 vCPU is slow; expect tens of seconds per question.
+
+If you intend to demo the full stack rather than just prove it runs, resize the pool
+first — `Standard_D4s_v5` (4 vCPU, 16GB) fits the 8Gi limit with room to spare:
+
+```bash
+az aks nodepool update --resource-group $RG --cluster-name $AKS_NAME \
+  --name nodepool1 --node-vm-size Standard_D4s_v5
+```
+
+On a 2-vCPU/4GB node — a B-series, say — the 3Gi request does not even schedule: the
+pod sits `Pending` with `Insufficient memory`.
 
 **Going back** is the same variable, emptied:
 
@@ -615,7 +685,11 @@ az aks start --resource-group $RG --name $AKS_NAME
 Worth settling before anyone follows this end to end:
 
 1. **Region.** `eastus` above. Pick whichever is nearest or wherever the student
-   subscriptions have quota — B-series quota in a busy region is a common blocker.
+   subscriptions have quota — quota in a busy region is a common blocker.
+   `Standard_D2s_v4` needs 2 vCPU of `Standard DSv4 Family` quota; resizing to
+   `Standard_D4s_v5` for the full retrieval stack needs 4 vCPU of `Standard DSv5
+   Family`, which is a separate quota and not always granted on a fresh student
+   subscription.
 2. **One resource group per student, or one shared?** Per student is cleaner to clean
    up and to reason about; shared is cheaper but means unique names for everything.
 3. **Does the class deploy with the `echo` provider or a real key?** Echo costs
