@@ -449,7 +449,7 @@ Verified against the live subscription and repository on 2026-11-06:
 | Repository variables and secrets | **Yes** — `ACR_NAME`, `AKS_NAME`, `AZURE_RESOURCE_GROUP`; `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` |
 | `production` environment | **Yes**, unprotected — deploys need no approval |
 | Role assignments on ACR and AKS (Step 2 below) | **No** — the identity has none, and nothing has been pushed to the registry yet |
-| ACR ↔ AKS pull permission ([Step 4](#step-4--let-aks-pull-from-acr)) | **No** — the kubelet identity has no `AcrPull`, so pods would `ImagePullBackOff` even once images exist |
+| ACR ↔ AKS pull permission ([Step 4](#step-4--let-aks-pull-from-acr)) | **Yes** — the kubelet identity (`671a5de7…`) holds `AcrPull` scoped to `legallensacr1`, so the cluster can pull without a registry password |
 
 So the pipeline is wired and the chain fires; what is missing is purely the three
 role assignments. Until they exist, CD fails in `build-and-push` at `az acr login`.
