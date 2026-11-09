@@ -236,6 +236,11 @@ Kubernetes service → **Settings → Container registry** → select the regist
 ```bash
 az aks get-credentials --resource-group $RG --name $AKS_NAME
 kubectl get nodes          # expect one node, STATUS Ready
+
+# Make `legallens` the default namespace for this context, so none of the kubectl
+# commands in this guide needs `-n legallens`. Skip it and every one of them looks
+# in `default` and reports nothing found.
+kubectl config set-context --current --namespace=legallens
 ```
 
 **Portal:** no equivalent — the portal has a browser shell (**Connect** button) but
@@ -304,6 +309,7 @@ and then the one you read is not the one that runs.
 
 | File | What it declares |
 |---|---|
+| `k8s/namespace.yaml` | the `legallens` namespace everything else lives in |
 | `k8s/pvc.yaml` | an 8Gi Azure Disk for the backend's `/data` |
 | `k8s/backend.yaml` | the API Deployment, and a **ClusterIP** Service — internal only |
 | `k8s/frontend.yaml` | the UI Deployment, and a **LoadBalancer** Service — the public IP |
@@ -318,15 +324,31 @@ place:
 - **`fsGroup: 10001`.** The image runs as that uid. Without it the mounted disk is
   root-owned, `/data` is not writable, and the error you see is a confusing runtime
   failure rather than a mount failure.
-- **The backend Service is named `backend` on port 8000.** That is already the
-  frontend image's default `BACKEND_URL`, so the frontend needs no configuration.
-  Rename the Service and you must set `BACKEND_URL` to match.
+- **The backend Service is named `backend` on port 8000, and the frontend is given
+  its fully qualified name.** The image's default `BACKEND_URL` is the bare
+  `http://backend:8000`, which is right for Docker Compose and wrong here: nginx's
+  `resolver` ignores the `search` domains in `/etc/resolv.conf`, so a bare name is
+  queried absolutely, CoreDNS says NXDOMAIN, and every `/api/` call is a 502. So
+  `frontend.yaml` sets `BACKEND_URL` to `backend.$(POD_NAMESPACE).svc.cluster.local`,
+  with the namespace read from the pod so the manifest stays portable. Rename the
+  Service and that value must change with it.
+
+  Worth knowing how this fails: the frontend's readiness probe only asks nginx for
+  `/healthz`, which it answers alone. The pod therefore goes **Ready** and the
+  rollout **succeeds** while the API is entirely unreachable. The smoke test's
+  `curl /api/health` is the only step that catches it — which is the reason that
+  step exists.
 - **Probes point at `/api/health` and `/healthz`.** The frontend's is answered by
   nginx alone — a readiness check that reached through to the API would take the UI
   out of service whenever the API was briefly unwell.
 
-To apply them **by hand** (CD does this for you — see Part 3). The image tag is a
-placeholder, so substitute it the same way the pipeline does:
+Every object in them names the **`legallens`** namespace, so `kubectl apply -f` puts
+it in the right place with no `-n` flag, and `kubectl delete namespace legallens` is a
+complete uninstall. Nothing this app owns is in `default`.
+
+To apply them **by hand** (CD does this for you — see Part 3). All seven values in
+them are placeholders, so substitute them the same way the pipeline does — including
+in `pvc.yaml`, which carries the disk size:
 
 ```bash
 export ACR_LOGIN=$(az acr show --name $ACR_NAME --query loginServer --output tsv)
@@ -334,14 +356,27 @@ export BACKEND_IMAGE=$ACR_LOGIN/legallens-backend:v1
 export FRONTEND_IMAGE=$ACR_LOGIN/legallens-frontend:v1
 export LLM_PROVIDER=echo        # or "anthropic" once the Secret from Step 7 exists
 
-kubectl apply -f k8s/pvc.yaml
-for m in k8s/backend.yaml k8s/frontend.yaml; do
-  envsubst '${BACKEND_IMAGE} ${FRONTEND_IMAGE} ${LLM_PROVIDER}' < "$m" | kubectl apply -f -
+# The four the pipeline derives from BACKEND_EXTRAS. These are the default stack;
+# for the full retrieval stack use 32Gi / 3Gi / 8Gi / 500m.
+export DATA_VOLUME_SIZE=8Gi
+export BACKEND_MEMORY_REQUEST=512Mi
+export BACKEND_MEMORY_LIMIT=2Gi
+export BACKEND_CPU_REQUEST=250m
+
+names='${BACKEND_IMAGE} ${FRONTEND_IMAGE} ${LLM_PROVIDER} ${DATA_VOLUME_SIZE}'
+names="${names} "'${BACKEND_MEMORY_REQUEST} ${BACKEND_MEMORY_LIMIT} ${BACKEND_CPU_REQUEST}'
+
+kubectl apply -f k8s/namespace.yaml      # first: the rest live inside it
+for m in k8s/pvc.yaml k8s/backend.yaml k8s/frontend.yaml; do
+  envsubst "$names" < "$m" | kubectl apply -f -
 done
 
-kubectl get pods -w                      # both Running and Ready
-kubectl get service frontend -w          # EXTERNAL-IP is <pending> for a minute or two
+kubectl get pods -n legallens -w               # both Running and Ready
+kubectl get service frontend -n legallens -w   # EXTERNAL-IP is <pending> for a minute or two
 ```
+
+`envsubst` with an explicit name list, not bare `envsubst`: it restricts substitution
+to exactly these seven, so a `$` anywhere else in a manifest survives untouched.
 
 Then open `http://<EXTERNAL-IP>`.
 
@@ -364,7 +399,8 @@ frontend.
 | `EXTERNAL-IP` stuck on `<pending>` for 5+ minutes | Quota or region issue. `kubectl describe service frontend`. |
 | PVC stuck `Pending` | Normal until a pod mounts it. Still pending after the pod starts → `kubectl describe pvc legallens-data`. |
 
-Useful always:
+Useful always — these assume the default namespace was set in
+[Step 5](#step-5--point-kubectl-at-the-cluster); otherwise add `-n legallens`:
 
 ```bash
 kubectl get pods
@@ -372,6 +408,10 @@ kubectl logs deploy/backend --tail=50
 kubectl describe pod <pod-name>
 kubectl exec -it deploy/backend -- sh
 ```
+
+A `kubectl` command that reports nothing at all, rather than an error, almost always
+means it looked in `default`. `kubectl config view --minify --output
+'jsonpath={..namespace}'` prints the namespace the context is actually using.
 
 ---
 
@@ -416,11 +456,11 @@ Verified against the live subscription and repository on 2026-11-06:
 |---|---|
 | Images tagged with the git SHA, never `latest` | **Yes** — `cd.yml` tags both images `:${{ needs.resolve.outputs.sha }}`, and `latest` appears nowhere in the workflows or the manifests |
 | Deploy runs automatically once CI passes on `main` | **Yes** — `workflow_run` on CI, gated on `conclusion == 'success'`; CD has fired on its own after the last two green CI runs on `main` |
-| App registration `legallens-cd` with both federated credentials | **Yes** — `github-main` (branch) and `github-env-production` (environment) |
+| App registration `legallens-cd` with both federated credentials | **Partly** — `github-main` (branch) and `github-env-production` (environment) both exist, but their subjects use the mutable `repo:hanoknaidu/legallens` prefix while this repository sends the immutable `repo:hanoknaidu@237133295/legallens@1440418111` form, so `azure/login` fails with `AADSTS700213`. Two matching credentials have to be added; see [Step 1](#step-1--an-identity-github-can-use-with-no-stored-password) |
 | Repository variables and secrets | **Yes** — `ACR_NAME`, `AKS_NAME`, `AZURE_RESOURCE_GROUP`; `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` |
 | `production` environment | **Yes**, unprotected — deploys need no approval |
 | Role assignments on ACR and AKS (Step 2 below) | **No** — the identity has none, and nothing has been pushed to the registry yet |
-| ACR ↔ AKS pull permission ([Step 4](#step-4--let-aks-pull-from-acr)) | **No** — the kubelet identity has no `AcrPull`, so pods would `ImagePullBackOff` even once images exist |
+| ACR ↔ AKS pull permission ([Step 4](#step-4--let-aks-pull-from-acr)) | **Yes** — the kubelet identity (`671a5de7…`) holds `AcrPull` scoped to `legallensacr1`, so the cluster can pull without a registry password |
 
 So the pipeline is wired and the chain fires; what is missing is purely the three
 role assignments. Until they exist, CD fails in `build-and-push` at `az acr login`.
@@ -449,21 +489,48 @@ job runs against the branch; the deploy job declares `environment: production`, 
 changes the subject. One credential authenticates one of them and the other fails
 with a confusing `AADSTS700213`.
 
+The subject also has a prefix, and it is **not** reliably `repo:<org>/<repo>`. A
+repository with GitHub's *immutable subject claim* enabled sends the numeric owner
+and repository IDs inside it:
+
+```
+repo:myorg@237133295/myrepo@1440418111:ref:refs/heads/main
+```
+
+That exists so that deleting a repository and recreating one with the same name
+cannot inherit its cloud access — the name is reusable, the IDs are not. It can be
+on by default for new repositories, and a credential written the short way then
+never matches anything. So ask GitHub what it will actually send rather than
+assuming:
+
+```bash
+# Prints the exact prefix this repository's tokens will carry, immutable or not.
+SUB_PREFIX=$(gh api "repos/${GH_ORG}/${GH_REPO}/actions/oidc/customization/sub" \
+  --jq ".sub_claim_prefix // \"repo:${GH_ORG}/${GH_REPO}\"")
+echo "subject prefix = ${SUB_PREFIX}"
+```
+
 ```bash
 az ad app federated-credential create --id $APP_ID --parameters "{
   \"name\": \"github-main\",
   \"issuer\": \"https://token.actions.githubusercontent.com\",
-  \"subject\": \"repo:${GH_ORG}/${GH_REPO}:ref:refs/heads/main\",
+  \"subject\": \"${SUB_PREFIX}:ref:refs/heads/main\",
   \"audiences\": [\"api://AzureADTokenExchange\"]
 }"
 
 az ad app federated-credential create --id $APP_ID --parameters "{
   \"name\": \"github-env-production\",
   \"issuer\": \"https://token.actions.githubusercontent.com\",
-  \"subject\": \"repo:${GH_ORG}/${GH_REPO}:environment:production\",
+  \"subject\": \"${SUB_PREFIX}:environment:production\",
   \"audiences\": [\"api://AzureADTokenExchange\"]
 }"
 ```
+
+If a deploy fails with `AADSTS700213`, read the subject Azure says it was presented
+— `azure/login` prints it in the log under *Federated token details* — and compare it
+character for character with `az ad app federated-credential list --id $APP_ID
+--query '[].subject'`. The fix is always to make the credential match the token, not
+the other way round.
 
 **Portal**
 
@@ -475,6 +542,10 @@ az ad app federated-credential create --id $APP_ID --parameters "{
    repository. Entity type **Branch**, branch `main`. Name it `github-main`.
 5. **Add a second credential** the same way, but entity type **Environment**, with
    environment name `production`.
+6. Check the **Subject identifier** each one generated. The portal builds it from the
+   org and repository *names*, so if this repository uses the immutable subject claim
+   described above, both values are wrong and have to be edited to the `@<id>` form.
+   The CLI block above avoids this by asking GitHub for the prefix.
 
 > Do **not** create a client secret. The whole point of federation is that there is
 > no secret to store.
