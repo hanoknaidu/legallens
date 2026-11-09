@@ -77,5 +77,14 @@ The two can drift. If you tune the prompt here, copy it back:
 cp intent_prompt.md ../backend/src/legal_lens/orchestrator/intent_prompt.md
 ```
 
-The backend version is the one that will eventually run in production; this one is for
-iterating quickly.
+The prompts are identical as of this writing. **The model is not.** This copy pins
+`claude-haiku-4-5` in `classify.py`, and so does the backend's own
+`orchestrator/intent.py` default — but the running service overrides it with
+`LEGAL_LENS_ROUTER_MODEL`, which defaults to **`claude-haiku-5-5`**. So a routing
+decision measured here was measured on the older model. Pass the same value if that
+matters to what you are checking; `backend/src/legal_lens/config.py` explains why the
+service moved (this prompt is 1742 tokens and 4.5's minimum cacheable prefix is 4096,
+which made a cache breakpoint on it a silent no-op).
+
+The backend version is the one that runs in production; this one is for iterating
+quickly.

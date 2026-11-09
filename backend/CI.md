@@ -2,31 +2,38 @@
 
 One workflow, `ci.yml`, in `.github/workflows/` **at the repository root** — not
 under `backend/`, where it was first written. Actions only reads workflows from
-the root, so a workflow filed in a subdirectory never runs at all.
+the root, so a workflow filed in a subdirectory never runs at all. `cd.yml` sits
+beside it and runs on this one succeeding ([CD_readme.md](../CD_readme.md)).
 
 `ci.yml` is the gate on `main`: ruff and the unit suite on two interpreters, the
-retrieval tests against real models, the production image built and booted, and
-the frontend linted, typechecked and built — with a browsable HTML test report
-and coverage report attached to every run.
+retrieval tests against real models, the production image built and booted, the
+frontend linted, typechecked and built, and the e2e specs collected — with a
+browsable HTML test report and coverage report attached to every run.
 
 There used to be a second workflow, `ci-retrieval.yml`, holding the retrieval
 tests on the theory that they were too expensive to gate. See
 [Why there is one workflow](#why-there-is-one-workflow).
 
 No secrets. Nothing in CI makes a network call to the vendor, so there is no
-`ANTHROPIC_API_KEY` in either workflow and nothing asks for one. That is a
+`ANTHROPIC_API_KEY` in the workflow and nothing asks for one. That is a
 constraint on what can be gated, not an oversight — see
 [What is not gated](#what-is-not-gated).
 
-## Scope: `backend/`, a subdirectory of the repository
+## Scope: four components, none of them at the repository root
 
-The git root is `Legal Lens/`, so `frontend/`, `e2e/` and `intent-classifier/`
-are all in the checkout. These two workflows nonetheless check `backend/` only:
-every job sets `working-directory: backend` for its `run:` steps, and the paths
-handed to actions — setup-uv's `cache-dependency-glob`, the Docker build
-`context` and `upload-artifact`'s `path` — are spelled `backend/...` relative to
-the root, because an action's own inputs ignore `working-directory`. The other three components have no CI yet; they need
-their own jobs.
+The git root is `Legal Lens/`, so `backend/`, `frontend/`, `e2e/` and
+`intent-classifier/` are all in the checkout, and all four are now checked —
+`backend/` by `quality`, `test`, `docker` and `retrieval`, `frontend/` by
+`frontend`, `e2e/` by `e2e-specs`, and `intent-classifier/` by a byte-compile
+step in `quality`. How deeply each is checked differs a great deal; see
+[What is not gated](#what-is-not-gated).
+
+Because no component sits at the root, every job sets its own
+`working-directory` — and the paths handed to *actions* rather than to `run:`
+steps are spelled from the root regardless: setup-uv's
+`cache-dependency-glob`, the Docker build `context`, setup-node's `cache-dependency-path`
+and `upload-artifact`'s `path` all carry their `backend/...`, `frontend/...` or
+`e2e/...` prefix, because an action's own inputs ignore `working-directory`.
 
 Two backend tests read across into the siblings — `test_conversation_titles.py`
 checks `frontend/src/lib/constants.ts` and `test_orchestrator_intent.py` checks
@@ -36,10 +43,12 @@ cross-component check those tests were written for, and it means a frontend
 constant drifting from the backend's now fails the gate.
 
 A prerequisite worth stating plainly: Actions runs on GitHub, so none of this
-executes until the branch is pushed. The remote exists
-(`github.com/hanoknaidu/legallens`); as of this writing the work is on
-`feature/webcode`, and `ci.yml` triggers on PRs to and pushes to `main`, so
-opening the PR is what first exercises it.
+executes until the branch is pushed. The remote is
+`github.com/hanoknaidu/legallens`, the work is on `feature/webcode`, and
+`ci.yml` triggers on PRs to and pushes to `main` — so a run on this branch comes
+from opening the PR or from `workflow_dispatch`, not from pushing it. The gate
+has run green on `main`, which is what CD reads
+([CD_readme.md](../CD_readme.md)).
 
 ## `ci.yml` — the gate
 
@@ -359,5 +368,8 @@ Node comes from `.nvmrc` at the repository root rather than a pin here.
 - **Type checking** — no mypy or ty is configured in `pyproject.toml`, and
   adding one as a blocking gate to a codebase that has never been checked would
   behave like the formatting problem above.
-- **`frontend/`, `e2e/`, `intent-classifier/`** — outside this repository; see
-  [Scope](#scope-this-repository-is-backend).
+- **Frontend unit tests** — there is no test script to run; `frontend` lints,
+  typechecks and builds. See [The frontend job](#the-frontend-job).
+- **The e2e suite for real, and `intent-classifier/classify.py`** — both need a
+  key and spend money per run, so the gate only proves the specs collect and the
+  script parses. See [What is not gated](#what-is-not-gated).
