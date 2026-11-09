@@ -198,8 +198,29 @@ jobs:
 
       # Before the secret and the manifests, both of which live in it. `apply` so a
       # cluster that already has the namespace is not an error.
+      #
+      # The guard is the point of this step, not the apply. Deploying into `default`
+      # is the failure this is here to prevent: it is the namespace a missing or
+      # empty `-n` silently falls back to, and objects that land there are mixed in
+      # with anything else on the cluster and cannot be removed as a unit.
       - name: Create the namespace
-        run: kubectl apply -f k8s/namespace.yaml
+        run: |
+          if [ -z "${NAMESPACE}" ] || [ "${NAMESPACE}" = "default" ]; then
+            echo "::error::refusing to deploy into '${NAMESPACE:-<empty>}'"
+            exit 1
+          fi
+
+          # Cross-check the manifests against it, so a stray edit to either one is
+          # caught here rather than discovered as objects in the wrong namespace.
+          for manifest in k8s/pvc.yaml k8s/backend.yaml k8s/frontend.yaml; do
+            if ! grep -q "^  namespace: ${NAMESPACE}$" "${manifest}"; then
+              echo "::error::${manifest} does not pin namespace '${NAMESPACE}'"
+              exit 1
+            fi
+          done
+
+          kubectl apply -f k8s/namespace.yaml
+          kubectl get namespace "${NAMESPACE}"
 
       # The API key, kept current in the cluster from one place. `apply` rather than
       # `create` so re-running is not an error, and `--dry-run=client -o yaml | apply`
@@ -290,8 +311,22 @@ jobs:
           names="${names} "'${BACKEND_MEMORY_REQUEST} ${BACKEND_MEMORY_LIMIT} ${BACKEND_CPU_REQUEST}'
           for manifest in k8s/pvc.yaml k8s/backend.yaml k8s/frontend.yaml; do
             envsubst "${names}" < "${manifest}" \
-              | tee "/tmp/$(basename "${manifest}")" | kubectl apply -f -
+              | tee "/tmp/$(basename "${manifest}")" \
+              | kubectl apply --namespace "${NAMESPACE}" -f -
           done
+
+          # kubectl rejects a manifest whose metadata.namespace contradicts --namespace,
+          # so reaching here means both agree. This last check is for the opposite
+          # mistake: something landing in `default` by another route.
+          stray="$(kubectl get all,pvc -n default \
+            -l app.kubernetes.io/part-of=legal-lens \
+            -o name 2>/dev/null || true)"
+          if [ -n "${stray}" ]; then
+            echo "::error::legal-lens objects found in the default namespace:"
+            echo "${stray}"
+            echo "Remove them with: kubectl delete all,pvc -n default -l app.kubernetes.io/part-of=legal-lens"
+            exit 1
+          fi
 
       # The apply above only says Kubernetes accepted the objects. Whether the new
       # pods actually started is a different claim, and it is the one that matters:
