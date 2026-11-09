@@ -1,0 +1,11 @@
+# Everything this app owns lives in one namespace, so `kubectl delete namespace
+# legallens` is a complete uninstall and a stray `kubectl delete` cannot reach
+# anything else sharing the cluster. Applied first by cd.yml: the objects in the
+# other three manifests name this namespace, so they cannot be created before it
+# exists.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: legallens
+  labels:
+    app.kubernetes.io/part-of: legal-lens

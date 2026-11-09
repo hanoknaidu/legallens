@@ -8,6 +8,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: legallens-data
+  namespace: legallens
   labels:
     app.kubernetes.io/part-of: legal-lens
 spec:

@@ -236,6 +236,11 @@ Kubernetes service → **Settings → Container registry** → select the regist
 ```bash
 az aks get-credentials --resource-group $RG --name $AKS_NAME
 kubectl get nodes          # expect one node, STATUS Ready
+
+# Make `legallens` the default namespace for this context, so none of the kubectl
+# commands in this guide needs `-n legallens`. Skip it and every one of them looks
+# in `default` and reports nothing found.
+kubectl config set-context --current --namespace=legallens
 ```
 
 **Portal:** no equivalent — the portal has a browser shell (**Connect** button) but
@@ -304,6 +309,7 @@ and then the one you read is not the one that runs.
 
 | File | What it declares |
 |---|---|
+| `k8s/namespace.yaml` | the `legallens` namespace everything else lives in |
 | `k8s/pvc.yaml` | an 8Gi Azure Disk for the backend's `/data` |
 | `k8s/backend.yaml` | the API Deployment, and a **ClusterIP** Service — internal only |
 | `k8s/frontend.yaml` | the UI Deployment, and a **LoadBalancer** Service — the public IP |
@@ -325,8 +331,13 @@ place:
   nginx alone — a readiness check that reached through to the API would take the UI
   out of service whenever the API was briefly unwell.
 
-To apply them **by hand** (CD does this for you — see Part 3). The image tag is a
-placeholder, so substitute it the same way the pipeline does:
+Every object in them names the **`legallens`** namespace, so `kubectl apply -f` puts
+it in the right place with no `-n` flag, and `kubectl delete namespace legallens` is a
+complete uninstall. Nothing this app owns is in `default`.
+
+To apply them **by hand** (CD does this for you — see Part 3). All seven values in
+them are placeholders, so substitute them the same way the pipeline does — including
+in `pvc.yaml`, which carries the disk size:
 
 ```bash
 export ACR_LOGIN=$(az acr show --name $ACR_NAME --query loginServer --output tsv)
@@ -334,14 +345,27 @@ export BACKEND_IMAGE=$ACR_LOGIN/legallens-backend:v1
 export FRONTEND_IMAGE=$ACR_LOGIN/legallens-frontend:v1
 export LLM_PROVIDER=echo        # or "anthropic" once the Secret from Step 7 exists
 
-kubectl apply -f k8s/pvc.yaml
-for m in k8s/backend.yaml k8s/frontend.yaml; do
-  envsubst '${BACKEND_IMAGE} ${FRONTEND_IMAGE} ${LLM_PROVIDER}' < "$m" | kubectl apply -f -
+# The four the pipeline derives from BACKEND_EXTRAS. These are the default stack;
+# for the full retrieval stack use 32Gi / 3Gi / 8Gi / 500m.
+export DATA_VOLUME_SIZE=8Gi
+export BACKEND_MEMORY_REQUEST=512Mi
+export BACKEND_MEMORY_LIMIT=2Gi
+export BACKEND_CPU_REQUEST=250m
+
+names='${BACKEND_IMAGE} ${FRONTEND_IMAGE} ${LLM_PROVIDER} ${DATA_VOLUME_SIZE}'
+names="${names} "'${BACKEND_MEMORY_REQUEST} ${BACKEND_MEMORY_LIMIT} ${BACKEND_CPU_REQUEST}'
+
+kubectl apply -f k8s/namespace.yaml      # first: the rest live inside it
+for m in k8s/pvc.yaml k8s/backend.yaml k8s/frontend.yaml; do
+  envsubst "$names" < "$m" | kubectl apply -f -
 done
 
-kubectl get pods -w                      # both Running and Ready
-kubectl get service frontend -w          # EXTERNAL-IP is <pending> for a minute or two
+kubectl get pods -n legallens -w               # both Running and Ready
+kubectl get service frontend -n legallens -w   # EXTERNAL-IP is <pending> for a minute or two
 ```
+
+`envsubst` with an explicit name list, not bare `envsubst`: it restricts substitution
+to exactly these seven, so a `$` anywhere else in a manifest survives untouched.
 
 Then open `http://<EXTERNAL-IP>`.
 
@@ -364,7 +388,8 @@ frontend.
 | `EXTERNAL-IP` stuck on `<pending>` for 5+ minutes | Quota or region issue. `kubectl describe service frontend`. |
 | PVC stuck `Pending` | Normal until a pod mounts it. Still pending after the pod starts → `kubectl describe pvc legallens-data`. |
 
-Useful always:
+Useful always — these assume the default namespace was set in
+[Step 5](#step-5--point-kubectl-at-the-cluster); otherwise add `-n legallens`:
 
 ```bash
 kubectl get pods
@@ -372,6 +397,10 @@ kubectl logs deploy/backend --tail=50
 kubectl describe pod <pod-name>
 kubectl exec -it deploy/backend -- sh
 ```
+
+A `kubectl` command that reports nothing at all, rather than an error, almost always
+means it looked in `default`. `kubectl config view --minify --output
+'jsonpath={..namespace}'` prints the namespace the context is actually using.
 
 ---
 

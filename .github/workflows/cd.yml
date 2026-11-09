@@ -49,6 +49,10 @@ permissions:
 env:
   BACKEND_REPOSITORY: legallens-backend
   FRONTEND_REPOSITORY: legallens-frontend
+  # Every object the app owns lives here (k8s/namespace.yaml), so a stray delete
+  # cannot reach anything else in the cluster. The manifests name it too; this is
+  # for the imperative kubectl calls below, which have no manifest to read it from.
+  NAMESPACE: legallens
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -192,6 +196,11 @@ jobs:
           kubectl version --client
           kubectl get nodes
 
+      # Before the secret and the manifests, both of which live in it. `apply` so a
+      # cluster that already has the namespace is not an error.
+      - name: Create the namespace
+        run: kubectl apply -f k8s/namespace.yaml
+
       # The API key, kept current in the cluster from one place. `apply` rather than
       # `create` so re-running is not an error, and `--dry-run=client -o yaml | apply`
       # because `kubectl create secret` has no upsert of its own.
@@ -255,6 +264,7 @@ jobs:
             exit 0
           fi
           kubectl create secret generic legallens-secrets \
+            --namespace "${NAMESPACE}" \
             --from-literal=ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}" \
             --dry-run=client -o yaml | kubectl apply -f -
 
@@ -293,8 +303,8 @@ jobs:
           # 20 minutes, not 5: the full retrieval image is 6.42GB and the node has
           # to pull it before the container starts. Returns as soon as the rollout
           # settles, so this costs nothing on the small image.
-          kubectl rollout status deployment/backend  --timeout=20m
-          kubectl rollout status deployment/frontend --timeout=5m
+          kubectl rollout status deployment/backend  --namespace "${NAMESPACE}" --timeout=20m
+          kubectl rollout status deployment/frontend --namespace "${NAMESPACE}" --timeout=5m
 
       # Only on a failed rollout, and only for the deployment that failed to settle.
       # Note what this does and does not undo: the previous image comes back, but a
@@ -305,12 +315,12 @@ jobs:
         run: |
           echo "::error::rollout did not settle — rolling back"
           for deployment in backend frontend; do
-            if ! kubectl rollout status "deployment/${deployment}" --timeout=30s >/dev/null 2>&1; then
-              kubectl rollout undo "deployment/${deployment}" || true
-              kubectl rollout status "deployment/${deployment}" --timeout=3m || true
+            if ! kubectl rollout status "deployment/${deployment}" --namespace "${NAMESPACE}" --timeout=30s >/dev/null 2>&1; then
+              kubectl rollout undo "deployment/${deployment}" --namespace "${NAMESPACE}" || true
+              kubectl rollout status "deployment/${deployment}" --namespace "${NAMESPACE}" --timeout=3m || true
             fi
           done
-          kubectl get pods -o wide
+          kubectl get pods -o wide --namespace "${NAMESPACE}"
 
       - name: Read the public address
         id: address
@@ -318,12 +328,12 @@ jobs:
           # The LoadBalancer IP is assigned asynchronously; on a first deploy it is
           # empty for a minute or two while Azure provisions it.
           for i in $(seq 1 30); do
-            ip="$(kubectl get service frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+            ip="$(kubectl get service frontend --namespace "${NAMESPACE}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
             [ -n "${ip}" ] && break
             sleep 10
           done
           if [ -z "${ip}" ]; then
-            echo "::warning::the frontend Service has no external IP yet; check 'kubectl get svc frontend'"
+            echo "::warning::the frontend Service has no external IP yet; check 'kubectl get svc frontend -n ${NAMESPACE}'"
             echo "url=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -365,6 +375,6 @@ jobs:
             echo "| URL | ${{ steps.address.outputs.url || 'not assigned' }} |"
             echo
             echo '```'
-            kubectl get pods -o wide 2>/dev/null || echo "cluster unreachable"
+            kubectl get pods -o wide --namespace "${NAMESPACE}" 2>/dev/null || echo "cluster unreachable"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
