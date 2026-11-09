@@ -9,9 +9,15 @@ runs in Docker on my laptop" to "it runs in Kubernetes and I can send someone th
 link." Where a shortcut is taken, it is marked **Shortcut** and says what the real
 answer would be.
 
-There are no CD pipelines here. [Part 3](#part-3--what-cd-will-need-later) lists what
-a pipeline would need from the resources below, so nothing has to be rebuilt when
-that work starts.
+The pipeline exists: `.github/workflows/cd.yml` builds, pushes and rolls out on CI
+succeeding on `main`. [Part 3](#part-3--setting-up-cd) is what it needs from the
+resources below — the federated identity, the role assignments and the repository
+variables — and [where this project stands today](#where-this-project-stands-today)
+records which of those are actually in place.
+
+Parts 1 and 2 are still worth walking through first: they build the cluster the
+pipeline deploys into, and doing one deploy by hand is how you find out whether a
+failure is the pipeline's or the cluster's.
 
 ---
 

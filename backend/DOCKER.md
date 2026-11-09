@@ -59,6 +59,15 @@ up on a Mac:
 HF_HOME=/data/hf
 ```
 
+This is what the cluster does: `k8s/backend.yaml` sets `HF_HOME=/data/hf`, and
+`cd.yml` sizes the pod and the PVC from the extras it was built with — 3Gi/8Gi
+and a 32Gi volume with `workflows`, 512Mi/2Gi and 8Gi without. Setting the
+repository variable `BACKEND_EXTRAS` to `orchestrator workflows` therefore
+switches the whole deployment, image and resources and provider together; see
+[CD_readme.md](../CD_readme.md#switching-on-the-full-retrieval-stack), which also
+notes that an 8Gi limit does not fit the current 8GB node and what to do about
+it.
+
 That downloads them once per volume rather than once per pod, keeps the image
 small enough to pull quickly, and leaves the version pinned by whatever is in
 the cache. Baking them in is the right call only if the cluster has no egress to
@@ -211,7 +220,12 @@ docker volume rm legallens-data                   # destroys every uploaded docu
 
 ## Notes for AKS
 
-**One replica, one worker.** This is the constraint to design the manifest
+The manifests that act on all of this now exist — `k8s/backend.yaml`,
+`k8s/frontend.yaml` and `k8s/pvc.yaml`, applied by `.github/workflows/cd.yml`
+with the image tag and the deployment shape substituted in. Read this section as
+the reasoning behind them rather than as work still to do.
+
+**One replica, one worker.** This is the constraint the manifest is designed
 around. The service keeps state in the process that a second worker or replica
 would silently fracture:
 

@@ -4,9 +4,9 @@
 #   docker compose up --build
 #   open http://localhost:8080
 #
-# Sign in with LEGAL_LENS_BOOTSTRAP_EMAIL / LEGAL_LENS_BOOTSTRAP_PASSWORD below —
-# attorney@firm.test / change-this-password unless you override them. Change them
-# before the first boot: the account is created once, on a database with no users.
+# There is no sign-in: the app opens straight into the chat and no route requires a
+# session (docs/auth.md). The BOOTSTRAP_* values below only matter if you turn
+# LEGAL_LENS_REQUIRE_AUTH on, which the browser app cannot currently get past.
 #
 # The browser talks only to the frontend. nginx inside it proxies /api to the
 # backend over this file's private network, which is why the app is same-origin
@@ -42,20 +42,18 @@ services:
       # The image defaults to prod, which disables /api/docs and
       # /api/openapi.json. This is a local stack, so the docs are worth having.
       LEGAL_LENS_ENVIRONMENT: "${LEGAL_LENS_ENVIRONMENT:-dev}"
-      # The app has required a sign-in since Phase 2 (docs/auth.md), and a container
-      # has no shell to run `auth.cli` in — so the first account is created at startup
-      # from these. Only when the users table is empty: restarting with them set
-      # cannot reset an existing password. Override before first boot, or create
-      # further accounts with
-      #   docker compose exec backend python -m legal_lens.auth.cli create you@firm.com
       # No sign-in: the app opens straight into the chat and no route requires a
       # session. `true` enforces sessions at the API, but the frontend has no login
-      # page to get one through (docs/auth.md).
+      # page to get one through (docs/auth.md), so only a client that drives
+      # POST /auth/signin itself can use the API with it on.
       LEGAL_LENS_REQUIRE_AUTH: "${LEGAL_LENS_REQUIRE_AUTH:-false}"
       # Only applies when REQUIRE_AUTH is on. Any email that signs in gets an
       # account. Convenient locally; for anything
       # reachable beyond this machine set it false and use `auth.cli create`.
       LEGAL_LENS_OPEN_SIGNIN: "${LEGAL_LENS_OPEN_SIGNIN:-true}"
+      # Creates the first account at startup, only while the users table is empty —
+      # a container has no shell to run `auth.cli` in. Restarting with these set
+      # cannot reset an existing password. Dormant while REQUIRE_AUTH is off.
       LEGAL_LENS_BOOTSTRAP_EMAIL: "${LEGAL_LENS_BOOTSTRAP_EMAIL:-attorney@firm.test}"
       LEGAL_LENS_BOOTSTRAP_PASSWORD: "${LEGAL_LENS_BOOTSTRAP_PASSWORD:-change-this-password}"
     volumes:
