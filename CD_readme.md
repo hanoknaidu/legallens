@@ -416,7 +416,7 @@ Verified against the live subscription and repository on 2026-11-06:
 |---|---|
 | Images tagged with the git SHA, never `latest` | **Yes** — `cd.yml` tags both images `:${{ needs.resolve.outputs.sha }}`, and `latest` appears nowhere in the workflows or the manifests |
 | Deploy runs automatically once CI passes on `main` | **Yes** — `workflow_run` on CI, gated on `conclusion == 'success'`; CD has fired on its own after the last two green CI runs on `main` |
-| App registration `legallens-cd` with both federated credentials | **Yes** — `github-main` (branch) and `github-env-production` (environment) |
+| App registration `legallens-cd` with both federated credentials | **Partly** — `github-main` (branch) and `github-env-production` (environment) both exist, but their subjects use the mutable `repo:hanoknaidu/legallens` prefix while this repository sends the immutable `repo:hanoknaidu@237133295/legallens@1440418111` form, so `azure/login` fails with `AADSTS700213`. Two matching credentials have to be added; see [Step 1](#step-1--an-identity-github-can-use-with-no-stored-password) |
 | Repository variables and secrets | **Yes** — `ACR_NAME`, `AKS_NAME`, `AZURE_RESOURCE_GROUP`; `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` |
 | `production` environment | **Yes**, unprotected — deploys need no approval |
 | Role assignments on ACR and AKS (Step 2 below) | **No** — the identity has none, and nothing has been pushed to the registry yet |
@@ -449,21 +449,48 @@ job runs against the branch; the deploy job declares `environment: production`, 
 changes the subject. One credential authenticates one of them and the other fails
 with a confusing `AADSTS700213`.
 
+The subject also has a prefix, and it is **not** reliably `repo:<org>/<repo>`. A
+repository with GitHub's *immutable subject claim* enabled sends the numeric owner
+and repository IDs inside it:
+
+```
+repo:myorg@237133295/myrepo@1440418111:ref:refs/heads/main
+```
+
+That exists so that deleting a repository and recreating one with the same name
+cannot inherit its cloud access — the name is reusable, the IDs are not. It can be
+on by default for new repositories, and a credential written the short way then
+never matches anything. So ask GitHub what it will actually send rather than
+assuming:
+
+```bash
+# Prints the exact prefix this repository's tokens will carry, immutable or not.
+SUB_PREFIX=$(gh api "repos/${GH_ORG}/${GH_REPO}/actions/oidc/customization/sub" \
+  --jq ".sub_claim_prefix // \"repo:${GH_ORG}/${GH_REPO}\"")
+echo "subject prefix = ${SUB_PREFIX}"
+```
+
 ```bash
 az ad app federated-credential create --id $APP_ID --parameters "{
   \"name\": \"github-main\",
   \"issuer\": \"https://token.actions.githubusercontent.com\",
-  \"subject\": \"repo:${GH_ORG}/${GH_REPO}:ref:refs/heads/main\",
+  \"subject\": \"${SUB_PREFIX}:ref:refs/heads/main\",
   \"audiences\": [\"api://AzureADTokenExchange\"]
 }"
 
 az ad app federated-credential create --id $APP_ID --parameters "{
   \"name\": \"github-env-production\",
   \"issuer\": \"https://token.actions.githubusercontent.com\",
-  \"subject\": \"repo:${GH_ORG}/${GH_REPO}:environment:production\",
+  \"subject\": \"${SUB_PREFIX}:environment:production\",
   \"audiences\": [\"api://AzureADTokenExchange\"]
 }"
 ```
+
+If a deploy fails with `AADSTS700213`, read the subject Azure says it was presented
+— `azure/login` prints it in the log under *Federated token details* — and compare it
+character for character with `az ad app federated-credential list --id $APP_ID
+--query '[].subject'`. The fix is always to make the credential match the token, not
+the other way round.
 
 **Portal**
 
@@ -475,6 +502,10 @@ az ad app federated-credential create --id $APP_ID --parameters "{
    repository. Entity type **Branch**, branch `main`. Name it `github-main`.
 5. **Add a second credential** the same way, but entity type **Environment**, with
    environment name `production`.
+6. Check the **Subject identifier** each one generated. The portal builds it from the
+   org and repository *names*, so if this repository uses the immutable subject claim
+   described above, both values are wrong and have to be edited to the `@<id>` form.
+   The CLI block above avoids this by asking GitHub for the prefix.
 
 > Do **not** create a client secret. The whole point of federation is that there is
 > no secret to store.
