@@ -324,9 +324,20 @@ place:
 - **`fsGroup: 10001`.** The image runs as that uid. Without it the mounted disk is
   root-owned, `/data` is not writable, and the error you see is a confusing runtime
   failure rather than a mount failure.
-- **The backend Service is named `backend` on port 8000.** That is already the
-  frontend image's default `BACKEND_URL`, so the frontend needs no configuration.
-  Rename the Service and you must set `BACKEND_URL` to match.
+- **The backend Service is named `backend` on port 8000, and the frontend is given
+  its fully qualified name.** The image's default `BACKEND_URL` is the bare
+  `http://backend:8000`, which is right for Docker Compose and wrong here: nginx's
+  `resolver` ignores the `search` domains in `/etc/resolv.conf`, so a bare name is
+  queried absolutely, CoreDNS says NXDOMAIN, and every `/api/` call is a 502. So
+  `frontend.yaml` sets `BACKEND_URL` to `backend.$(POD_NAMESPACE).svc.cluster.local`,
+  with the namespace read from the pod so the manifest stays portable. Rename the
+  Service and that value must change with it.
+
+  Worth knowing how this fails: the frontend's readiness probe only asks nginx for
+  `/healthz`, which it answers alone. The pod therefore goes **Ready** and the
+  rollout **succeeds** while the API is entirely unreachable. The smoke test's
+  `curl /api/health` is the only step that catches it — which is the reason that
+  step exists.
 - **Probes point at `/api/health` and `/healthz`.** The frontend's is answered by
   nginx alone — a readiness check that reached through to the API would take the UI
   out of service whenever the API was briefly unwell.

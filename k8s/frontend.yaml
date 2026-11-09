@@ -1,8 +1,13 @@
 # The UI, and the only thing exposed to the internet.
 #
-# No BACKEND_URL here on purpose: the image already defaults to
-# http://backend:8000, which is exactly the Service name and port defined in
-# backend.yaml. Setting it again would be a second place to keep in step.
+# BACKEND_URL is set here, and it has to be a fully qualified name. The image
+# defaults to http://backend:8000, which is correct under Docker Compose because
+# Docker's embedded DNS resolves bare service names. In Kubernetes it fails:
+# nginx's `resolver` does not apply the `search` domains from /etc/resolv.conf,
+# so it queries `backend` as an absolute name, CoreDNS answers NXDOMAIN, and
+# every /api/ request is a 502 with "backend could not be resolved" in the log.
+# The frontend's own /healthz still passes, because nginx answers that alone —
+# so the pod reports Ready while the API is unreachable.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,6 +34,16 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          env:
+            # Taken from the pod rather than hardcoded, so the same manifest is
+            # correct in whichever namespace it is applied to. Kubernetes expands
+            # $(POD_NAMESPACE) because it is declared before the value that uses it.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: BACKEND_URL
+              value: "http://backend.$(POD_NAMESPACE).svc.cluster.local:8000"
           readinessProbe:
             # Answered by nginx alone, with no call to the backend. A readiness
             # check that reached through to the API would take the whole UI out
